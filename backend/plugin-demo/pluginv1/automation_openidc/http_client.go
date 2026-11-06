@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -940,6 +941,46 @@ func (c *Client) ListOSImages(ctx context.Context, hsName string) (map[string][]
 	result["iso"] = append(result["iso"], parseOSImageField(cfg.ImagesMaps, "iso")...)
 	result["system"] = append(result["system"], parseOSImageField(cfg.SystemMaps, "system")...)
 	return result, nil
+}
+
+// ResolveOSImageFile 把平台下发的镜像显示名（sys_name）解析为上游真实文件名（sys_file）。
+//
+// 平台可能只下发镜像显示名（AutomationCreateHostRequest.OS），但上游 CreateVM 的
+// os_name 必须是 system_maps 里的 sys_file。直接把显示名传下去会得到
+// 「镜像文件不存在: /var/lib/vz/template/import/Debian Server 13.3 LTS」。
+func (c *Client) ResolveOSImageFile(ctx context.Context, hsName, osName string) string {
+	name := strings.TrimSpace(osName)
+	if name == "" {
+		return ""
+	}
+	// 已经是文件名（带常见扩展名）时直接使用，避免多余的上游请求
+	if looksLikeImageFile(name) {
+		return name
+	}
+	images, err := c.ListOSImages(ctx, hsName)
+	if err != nil {
+		pluginLog.Printf("ResolveOSImageFile: list images for %s failed: %v", hsName, err)
+		return name
+	}
+	// 优先系统模板（CreateVM 只接受 system_maps），再退到 ISO 分类
+	for _, category := range []string{"system", "iso"} {
+		for _, img := range images[category] {
+			if strings.EqualFold(strings.TrimSpace(img.Name), name) && strings.TrimSpace(img.File) != "" {
+				return strings.TrimSpace(img.File)
+			}
+		}
+	}
+	pluginLog.Printf("ResolveOSImageFile: hs=%s 未找到显示名 %q 对应的 sys_file，按原值下发", hsName, name)
+	return name
+}
+
+// looksLikeImageFile 判断名称是否已经是镜像文件名（而非显示名）。
+func looksLikeImageFile(name string) bool {
+	switch strings.ToLower(path.Ext(strings.TrimSpace(name))) {
+	case ".qcow2", ".vmdk", ".img", ".raw", ".iso", ".template", ".vhd", ".vhdx", ".ova":
+		return true
+	}
+	return false
 }
 
 // parseOSImageField 统一解析 images_maps / system_maps 两种历史格式

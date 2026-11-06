@@ -485,7 +485,7 @@ type automationServer struct {
 
 // ListAreas 地区列表（从 OpenIDCS server_area 字段获取）
 func (a *automationServer) ListAreas(ctx context.Context, _ *pluginv1.Empty) (*pluginv1.ListAreasResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -515,7 +515,7 @@ c, last, err := a.core.newClientWithTrace()
 // ListLines 线路列表（映射 OpenIDCS 主机列表，每台主机 = 一条线路）
 // line_id = fnv64(hs_name)
 func (a *automationServer) ListLines(ctx context.Context, _ *pluginv1.Empty) (*pluginv1.ListLinesResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -572,7 +572,7 @@ func (a *automationServer) ListPackages(ctx context.Context, req *pluginv1.ListP
 		// 如果 line_id 无法解析，返回空列表（兼容旧行为）
 		return &pluginv1.ListPackagesResponse{Items: []*pluginv1.AutomationPackage{}}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -619,7 +619,7 @@ c, last, err := a.core.newClientWithTrace()
 // 若 config.HsName 已配置则只查该主机，否则查 line_id 对应主机
 // line_id = fnv64(hs_name)，image_id = fnv64(hs_name + "/img/" + img.File)
 func (a *automationServer) ListImages(ctx context.Context, req *pluginv1.ListImagesRequest) (*pluginv1.ListImagesResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -725,7 +725,7 @@ func (a *automationServer) CreateInstance(ctx context.Context, req *pluginv1.Cre
 	if a.core.cfg.DryRun {
 		return &pluginv1.CreateInstanceResponse{InstanceId: fnv64(fmt.Sprintf("dry-run/%d", time.Now().UnixNano()))}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -735,14 +735,29 @@ c, last, err := a.core.newClientWithTrace()
 	}
 	// 解析 image_id → img.File
 	isoName := ""
+	imageIDHit := false
 	if req.GetImageId() != 0 {
 		if raw, ok := a.core.ids.get(req.GetImageId()); ok {
 			// raw 格式：{hs_name}/img/{img.File}
 			parts := strings.SplitN(raw, "/img/", 2)
 			if len(parts) == 2 {
 				isoName = parts[1]
+				imageIDHit = true
 			}
 		}
+	}
+	// 兜底：image_id 缓存未命中（插件重启后内存缓存丢失，或平台只下发镜像显示名）时，
+	// 用显示名回查上游 os-images 换成 sys_file。上游 CreateVM 的 os_name 必须是文件名，
+	// 传显示名会得到「镜像文件不存在: /var/lib/vz/.../Debian Server 13.3 LTS」。
+	if !imageIDHit && strings.TrimSpace(req.GetOs()) != "" {
+		rawOS := strings.TrimSpace(req.GetOs())
+		isoName = c.ResolveOSImageFile(ctx, hsName, rawOS)
+		if isoName != rawOS {
+			pluginLog.Printf("[CreateInstance] 镜像名解析 hs=%s %q -> %q", hsName, rawOS, isoName)
+		}
+	}
+	if isoName == "" && req.GetImageId() != 0 {
+		return nil, fmt.Errorf("image_id %d not resolved (plugin restarted?) and os is empty, please call ListImages first", req.GetImageId())
 	}
 	body := map[string]any{
 		// vm_uuid 同时作为虚拟机名称下发，确保创建后可通过该值回查 VM。
@@ -964,7 +979,7 @@ func probeVMCreateFailure(ctx context.Context, c *Client, hsName, vmUUID string)
 
 // ListInstancesSimple 简易实例搜索（遍历所有主机下的虚拟机）
 func (a *automationServer) ListInstancesSimple(ctx context.Context, req *pluginv1.ListInstancesSimpleRequest) (*pluginv1.ListInstancesSimpleResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1013,7 +1028,7 @@ func (a *automationServer) Start(ctx context.Context, req *pluginv1.StartRequest
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1032,7 +1047,7 @@ func (a *automationServer) Shutdown(ctx context.Context, req *pluginv1.ShutdownR
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1051,7 +1066,7 @@ func (a *automationServer) Reboot(ctx context.Context, req *pluginv1.RebootReque
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1071,7 +1086,7 @@ func (a *automationServer) Rebuild(ctx context.Context, req *pluginv1.RebuildReq
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1124,7 +1139,7 @@ func (a *automationServer) ElasticUpdate(ctx context.Context, req *pluginv1.Elas
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1156,7 +1171,7 @@ func (a *automationServer) Lock(ctx context.Context, req *pluginv1.LockRequest) 
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1190,7 +1205,7 @@ func (a *automationServer) Destroy(ctx context.Context, req *pluginv1.DestroyReq
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1206,7 +1221,7 @@ c, last, err := a.core.newClientWithTrace()
 
 // GetVNCURL 获取 VNC 控制台地址
 func (a *automationServer) GetVNCURL(ctx context.Context, req *pluginv1.GetVNCURLRequest) (*pluginv1.GetVNCURLResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1237,7 +1252,7 @@ c, last, err := a.core.newClientWithTrace()
 //  2. 拼接 {base_url}/api/client/templogin?token={temp_token} 作为跳转地址；
 //  3. 若临时 token 缺失则降级返回 base_url，由用户自行登录。
 func (a *automationServer) GetPanelURL(ctx context.Context, req *pluginv1.GetPanelURLRequest) (*pluginv1.GetPanelURLResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1267,7 +1282,7 @@ c, last, err := a.core.newClientWithTrace()
 
 // GetMonitor 获取监控数据
 func (a *automationServer) GetMonitor(ctx context.Context, req *pluginv1.GetMonitorRequest) (*pluginv1.GetMonitorResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1385,7 +1400,7 @@ func extractFloat(m map[string]any, keys ...string) float64 {
 
 // ListPortMappings 获取 NAT 规则列表
 func (a *automationServer) ListPortMappings(ctx context.Context, req *pluginv1.ListPortMappingsRequest) (*pluginv1.ListPortMappingsResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1426,7 +1441,7 @@ func (a *automationServer) AddPortMapping(ctx context.Context, req *pluginv1.Add
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1456,7 +1471,7 @@ func (a *automationServer) DeletePortMapping(ctx context.Context, req *pluginv1.
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1478,7 +1493,7 @@ func (a *automationServer) FindPortCandidates(ctx context.Context, req *pluginv1
 		return &pluginv1.FindPortCandidatesResponse{Ports: []int64{}}, nil
 	}
 	_ = vmUUID // 端口候选基于主机，不需要 vm_uuid
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1498,7 +1513,7 @@ c, last, err := a.core.newClientWithTrace()
 
 // ListBackups 获取备份列表
 func (a *automationServer) ListBackups(ctx context.Context, req *pluginv1.ListBackupsRequest) (*pluginv1.ListBackupsResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1533,7 +1548,7 @@ func (a *automationServer) CreateBackup(ctx context.Context, req *pluginv1.Creat
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1553,7 +1568,7 @@ func (a *automationServer) DeleteBackup(ctx context.Context, req *pluginv1.Delet
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1581,7 +1596,7 @@ func (a *automationServer) RestoreBackup(ctx context.Context, req *pluginv1.Rest
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1608,7 +1623,7 @@ c, last, err := a.core.newClientWithTrace()
 
 // ListSnapshots 获取快照列表
 func (a *automationServer) ListSnapshots(ctx context.Context, req *pluginv1.ListSnapshotsRequest) (*pluginv1.ListSnapshotsResponse, error) {
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1643,7 +1658,7 @@ func (a *automationServer) CreateSnapshot(ctx context.Context, req *pluginv1.Cre
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}
@@ -1663,7 +1678,7 @@ func (a *automationServer) DeleteSnapshot(ctx context.Context, req *pluginv1.Del
 	if a.core.cfg.DryRun {
 		return &pluginv1.OperationResult{Ok: true}, nil
 	}
-c, last, err := a.core.newClientWithTrace()
+	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
 		return nil, err
 	}

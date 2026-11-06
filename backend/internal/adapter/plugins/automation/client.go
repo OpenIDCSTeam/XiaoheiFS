@@ -106,6 +106,7 @@ func ensureOpOK(resp proto.Message) error {
 func (c *PluginInstanceClient) CreateHost(ctx context.Context, req appshared.AutomationCreateHostRequest) (appshared.AutomationCreateHostResult, error) {
 	pb := &pluginv1.CreateInstanceRequest{
 		LineId:        req.LineID,
+		ImageId:       req.ImageID,
 		Os:            req.OS,
 		Name:          req.HostName,
 		Password:      req.SysPwd,

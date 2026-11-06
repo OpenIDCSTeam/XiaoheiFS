@@ -1302,6 +1302,7 @@ func (s *OrderService) provisionItem(ctx context.Context, order domain.Order, it
 	expireAt := time.Now().AddDate(0, months, 0)
 	req := AutomationCreateHostRequest{
 		LineID:     plan.LineID,
+		ImageID:    img.ImageID,
 		OS:         img.Name,
 		CPU:        cpu,
 		MemoryGB:   mem,

@@ -207,7 +207,11 @@ type PaymentProviderRegistry interface {
 }
 
 type AutomationCreateHostRequest struct {
-	LineID     int64
+	LineID int64
+	// ImageID 是插件侧 ListImages 返回的镜像 ID。
+	// 插件内部以它为 key 反查真实镜像文件名（sys_file）；OS 只是显示名，
+	// 部分上游（如 OpenIDCS）不接受显示名，必须下发 ImageID。
+	ImageID    int64
 	OS         string
 	CPU        int
 	MemoryGB   int

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -49,6 +51,25 @@ func (c *Client) WithLogger(fn func(context.Context, HTTPLogEntry)) *Client {
 	c.logFn = fn
 	return c
 }
+
+// ---- CSRF Token ----
+
+// errCSRFExpired 标记上游拒绝了当前 CSRF Token，刷新后可重试。
+var errCSRFExpired = errors.New("csrf token rejected by upstream")
+
+// csrfTokenCache 按主控地址缓存 CSRF Token。
+//
+// 背景：CloudHost 主控的 /api 分组启用了 auth.CSRFMiddleware，
+// 所有 POST/PUT/DELETE 请求都必须携带 X-CSRF-Token，否则返回
+// 403 {"error":"CSRF token 无效或已过期"}；GET 等安全方法豁免。
+//
+// 插件每个 RPC 都会 NewClient，token 挂在 Client 实例上命中率极低，
+// 因此改用包级缓存。Token 由主控内存保存（24h 有效），主控重启后会全部
+// 失效，由 doRequest 的 403 重试兜底。
+var (
+	csrfCacheMu sync.RWMutex
+	csrfCache   = make(map[string]string)
+)
 
 // ---- 响应结构 ----
 
@@ -1256,8 +1277,101 @@ func (c *Client) DeleteFirewallRule(ctx context.Context, hsName, vmUUID string, 
 
 // ---- 内部工具方法 ----
 
-// doRequest 执行 HTTP 请求，统一处理认证、响应解析和日志
+// needsCSRF 判断该方法是否需要携带 CSRF Token。
+// 与上游 auth.CSRFMiddleware 保持一致：GET/HEAD/OPTIONS/TRACE 属于安全方法。
+func needsCSRF(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return false
+	}
+	return true
+}
+
+// ensureCSRFToken 返回缓存的 CSRF Token，未命中时向主控申请。
+func (c *Client) ensureCSRFToken(ctx context.Context) (string, error) {
+	csrfCacheMu.RLock()
+	token := csrfCache[c.baseURL]
+	csrfCacheMu.RUnlock()
+	if token != "" {
+		return token, nil
+	}
+
+	endpoint := c.baseURL + "/api/csrf-token"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("create csrf request: %w", err)
+	}
+	// 该接口在 CloudHost 属于公开路由，带上 Bearer 无副作用；
+	// 若对接的旧版本对 /api 全量鉴权，带上更稳妥。
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch csrf token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("read csrf response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch csrf token: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var payload struct {
+		CSRF string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", fmt.Errorf("decode csrf response: %w", err)
+	}
+	if payload.CSRF == "" {
+		return "", fmt.Errorf("fetch csrf token: empty csrf_token")
+	}
+
+	csrfCacheMu.Lock()
+	csrfCache[c.baseURL] = payload.CSRF
+	csrfCacheMu.Unlock()
+	return payload.CSRF, nil
+}
+
+// invalidateCSRFToken 丢弃缓存中的 CSRF Token（上游重启或过期时调用）。
+func (c *Client) invalidateCSRFToken() {
+	csrfCacheMu.Lock()
+	delete(csrfCache, c.baseURL)
+	csrfCacheMu.Unlock()
+}
+
+// extractUpstreamError 提取非统一信封的错误原因。
+// 例如 CloudHost 的 CSRF 校验失败会返回 {"error":"CSRF token 无效或已过期"}。
+func extractUpstreamError(body []byte) string {
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Error)
+}
+
+// doRequest 执行 HTTP 请求，统一处理认证、CSRF、响应解析和日志。
+// 主控的 CSRF Token 保存在内存中，主控重启后全部失效，
+// 因此命中 CSRF 403 时刷新 Token 并重试一次（403 发生在业务处理前，重试安全）。
 func (c *Client) doRequest(ctx context.Context, method, path string, body any) (apiResponse, error) {
+	resp, err := c.doRequestOnce(ctx, method, path, body)
+	if err == nil {
+		return resp, nil
+	}
+	if errors.Is(err, errCSRFExpired) {
+		pluginLog.Printf("HTTP %s %s CSRF token rejected, refreshing and retrying once", method, c.baseURL+path)
+		c.invalidateCSRFToken()
+		return c.doRequestOnce(ctx, method, path, body)
+	}
+	return resp, err
+}
+
+// doRequestOnce 执行单次 HTTP 请求，不做重试。
+func (c *Client) doRequestOnce(ctx context.Context, method, path string, body any) (apiResponse, error) {
 	endpoint := c.baseURL + path
 
 	var reqBody []byte
@@ -1281,6 +1395,16 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any) (
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if needsCSRF(method) {
+		token, tokenErr := c.ensureCSRFToken(ctx)
+		if tokenErr != nil {
+			// 老版本主控或直连 HostAgent 可能没有 /api/csrf-token，
+			// 此时降级为不带该头继续请求，由上游决定是否校验。
+			pluginLog.Printf("HTTP %s %s fetch csrf token failed, fallback without header: %v", method, endpoint, tokenErr)
+		} else if token != "" {
+			req.Header.Set("X-CSRF-Token", token)
+		}
 	}
 
 	start := time.Now()
@@ -1310,6 +1434,25 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any) (
 
 	pluginLog.Printf("HTTP %s %s => status=%d code=%d msg=%q (%dms)",
 		method, endpoint, resp.StatusCode, parsed.Code, parsed.Msg, duration.Milliseconds())
+
+	// 非 2xx 响应可能不带统一信封（code/msg 均为空），
+	// 例如 CSRF 拦截返回 {"error":"CSRF token 无效或已过期"}，
+	// 这里统一把 error 字段纳入错误信息，避免上层只看到 code=0。
+	if resp.StatusCode >= 400 {
+		msg := extractUpstreamError(respBody)
+		if msg == "" {
+			msg = strings.TrimSpace(parsed.Msg)
+		}
+		if msg == "" {
+			msg = "upstream returned no error message"
+		}
+		err = fmt.Errorf("openidc error: %s (HTTP %d)", msg, resp.StatusCode)
+		c.emitLog(ctx, method, endpoint, string(reqBody), resp, respBody, duration, err)
+		if resp.StatusCode == http.StatusForbidden && strings.Contains(strings.ToUpper(msg), "CSRF") {
+			return apiResponse{}, fmt.Errorf("%w: %s", errCSRFExpired, msg)
+		}
+		return apiResponse{}, err
+	}
 
 	c.emitLog(ctx, method, endpoint, string(reqBody), resp, respBody, duration, nil)
 

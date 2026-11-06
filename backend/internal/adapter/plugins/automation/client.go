@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"xiaoheiplay/internal/adapter/plugins/core"
@@ -55,14 +57,41 @@ func (c *PluginInstanceClient) call(ctx context.Context, action string, req prot
 		c.logRPC(ctx, action, req, nil, 0, err)
 		return nil, err
 	}
-	cctx, cancel := c.withTimeout(ctx)
-	defer cancel()
 	start := time.Now()
-	resp, err := fn(cctx, cli)
-	err = mapUnimplemented(err)
+	resp, rpcErr := c.invoke(ctx, cli, fn)
+
+	// 自愈：插件进程退出/被外部结束后，go-plugin 仍缓存旧地址，
+	// 表现为 codes.Unavailable（connection refused）。重启实例后重试一次。
+	if isPluginUnavailable(rpcErr) && c.mgr != nil {
+		restartCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		restartErr := c.mgr.RestartInstance(restartCtx, "automation", c.pluginID, c.instanceID)
+		cancel()
+		if restartErr == nil {
+			if fresh, err := c.client(ctx); err == nil {
+				resp, rpcErr = c.invoke(ctx, fresh, fn)
+			}
+		}
+	}
+
+	err = mapUnimplemented(rpcErr)
 	err = mapRPCBusinessError(err)
 	c.logRPC(ctx, action, req, resp, time.Since(start), err)
 	return resp, err
+}
+
+// invoke 执行一次 RPC，仅做单次超时控制，保留原始错误供自愈判定。
+func (c *PluginInstanceClient) invoke(ctx context.Context, cli pluginv1.AutomationServiceClient, fn func(context.Context, pluginv1.AutomationServiceClient) (proto.Message, error)) (proto.Message, error) {
+	cctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	return fn(cctx, cli)
+}
+
+// isPluginUnavailable 判断是否为传输层不可用（插件进程退出、连接被拒等）。
+func isPluginUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.Unavailable
 }
 
 func ensureOpOK(resp proto.Message) error {

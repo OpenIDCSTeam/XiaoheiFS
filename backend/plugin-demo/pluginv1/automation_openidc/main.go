@@ -20,6 +20,12 @@ import (
 // pluginLog 插件日志，写入当前目录下的 plugin.log 文件
 var pluginLog *log.Logger
 
+// pendingAutoStart 记录"已提交创建、等待首次自动开机"的实例。
+// CreateInstance 提交的是异步任务，创建期间调用电源接口会让上游把请求 ctx
+// 覆盖到同一 vm_uuid 的任务 ctx 上，导致 PVE 创建请求 context canceled；
+// 因此自动开机推迟到 GetInstance 首次确认 VM 存在时执行，且只执行一次。
+var pendingAutoStart sync.Map // map[int64]struct{}
+
 func initLogger() {
 	f, err := os.OpenFile("plugin.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
@@ -842,12 +848,12 @@ func (a *automationServer) CreateInstance(ctx context.Context, req *pluginv1.Cre
 		}
 	}
 
-	// 创建完成后自动开机
-	if startErr := c.PowerVM(ctx, hsName, vmUUID, "S_START"); startErr != nil {
-		pluginLog.Printf("[CreateInstance] 自动开机失败 hs=%s vm=%s: %v", hsName, vmUUID, startErr)
-	}
-
 	instanceID := a.core.ids.instanceID(hsName, vmUUID)
+	// 创建是异步任务，此刻 VM 可能还不存在，不能立即调用 /api/client/powers：
+	// 上游 CloudHost 会把电源请求的 ctx 绑定到该 vm_uuid，覆盖创建任务绑定的 ctx，
+	// 电源请求返回后 ctx 即被取消，正在执行的 PVE 创建请求就会报 context canceled。
+	// 这里只登记待开机，等 GetInstance 首次确认 VM 存在后再执行。
+	pendingAutoStart.Store(instanceID, struct{}{})
 	return &pluginv1.CreateInstanceResponse{InstanceId: instanceID}, nil
 }
 
@@ -918,6 +924,18 @@ func (a *automationServer) GetInstance(ctx context.Context, req *pluginv1.GetIns
 		state = 10
 	}
 	instanceID := a.core.ids.instanceID(hsName, info.VMUUID)
+
+	// 开通后的首次自动开机：只有 CreateInstance 登记过的实例才会执行一次，
+	// 用户后续手动关机不会被重新拉起。
+	if _, ok := pendingAutoStart.LoadAndDelete(instanceID); ok && strings.ToLower(info.Status) != "running" {
+		if startErr := c.PowerVM(ctx, hsName, info.VMUUID, "S_START"); startErr != nil {
+			pluginLog.Printf("[GetInstance] 自动开机失败 hs=%s vm=%s: %v", hsName, info.VMUUID, startErr)
+			pendingAutoStart.Store(instanceID, struct{}{}) // 允许后续轮询重试
+		} else {
+			pluginLog.Printf("[GetInstance] 自动开机成功 hs=%s vm=%s", hsName, info.VMUUID)
+			state = 2
+		}
+	}
 
 	// 构建远程地址：public_addr:映射端口
 	// 查询主机 public_addr 和 NAT 规则，拼接为 "公网IP:宿主机端口" 格式

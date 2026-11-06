@@ -471,6 +471,64 @@ func (c *Client) GetAvailablePorts(ctx context.Context, hsName string) (Availabl
 	return data, nil
 }
 
+// PickAvailablePort 从主机端口段中挑一个未被占用的 WAN 端口。
+//
+// 上游 CloudHost 的 /api/server/ports/{hs} 只返回 ports_start/ports_close 区间，
+// 不提供 available_ports 列表，因此需要插件侧结合各 VM 已有的 NAT 规则自行计算；
+// 若上游将来返回 available_ports，则优先使用该列表。
+func (c *Client) PickAvailablePort(ctx context.Context, hsName string, exclude map[int]bool) (int, error) {
+	avail, err := c.GetAvailablePorts(ctx, hsName)
+	if err != nil {
+		return 0, err
+	}
+	if len(avail.AvailablePorts) > 0 {
+		for _, p := range avail.AvailablePorts {
+			if p > 0 && !exclude[int(p)] {
+				return int(p), nil
+			}
+		}
+	}
+	start, end := avail.PortsStart, avail.PortsClose
+	if start <= 0 || end < start {
+		return 0, fmt.Errorf("主机 %s 未配置可用端口段（ports_start/ports_close）", hsName)
+	}
+	used, err := c.usedWanPorts(ctx, hsName)
+	if err != nil {
+		return 0, err
+	}
+	for p := start; p <= end; p++ {
+		if used[p] || exclude[p] {
+			continue
+		}
+		return p, nil
+	}
+	return 0, fmt.Errorf("主机 %s 端口段 %d-%d 已无可用端口", hsName, start, end)
+}
+
+// usedWanPorts 汇总主机上所有虚拟机已占用的 WAN 端口。
+func (c *Client) usedWanPorts(ctx context.Context, hsName string) (map[int]bool, error) {
+	used := make(map[int]bool)
+	vms, err := c.ListVMs(ctx, hsName)
+	if err != nil {
+		return used, err
+	}
+	for _, vm := range vms {
+		if strings.TrimSpace(vm.VMUUID) == "" {
+			continue
+		}
+		rules, err := c.ListNATRules(ctx, hsName, vm.VMUUID)
+		if err != nil {
+			continue
+		}
+		for _, r := range rules {
+			if r.WanPort > 0 {
+				used[r.WanPort] = true
+			}
+		}
+	}
+	return used, nil
+}
+
 // ---- 虚拟机管理 ----
 
 // VMTask 上游异步任务摘要（CloudHost /api/system/async_task/list）

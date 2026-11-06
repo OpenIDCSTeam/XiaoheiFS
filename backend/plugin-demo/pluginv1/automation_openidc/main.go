@@ -92,6 +92,49 @@ func retryPendingCreate(ctx context.Context, c *Client, instanceID int64, detail
 	return true
 }
 
+// pendingNATRule 记录"创建成功后需要自动映射端口"的实例。
+// 与自动开机同理：创建是异步任务，VM 尚未纳管时调用 natadd 会返回"虚拟机不存在"，
+// 因此推迟到 GetInstance 首次确认 VM 存在后执行。
+type pendingNATRule struct {
+	lanPort  int
+	attempts int
+}
+
+var pendingNAT sync.Map // map[int64]pendingNATRule
+
+// ensureNATRule 幂等地补齐端口映射：已有同 lan_port 的规则时直接返回。
+// 选端口时排除主机上已被其它 VM 占用的 WAN 端口；添加失败时换端口重试。
+func ensureNATRule(ctx context.Context, c *Client, hsName, vmUUID string, lanPort int) error {
+	if rules, err := c.ListNATRules(ctx, hsName, vmUUID); err == nil {
+		for _, r := range rules {
+			if r.LanPort == lanPort {
+				return nil
+			}
+		}
+	}
+	exclude := make(map[int]bool)
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		wanPort, err := c.PickAvailablePort(ctx, hsName, exclude)
+		if err != nil {
+			return err
+		}
+		exclude[wanPort] = true
+		if err := c.AddNATRule(ctx, hsName, vmUUID, wanPort, lanPort, "tcp", fmt.Sprintf("auto-remote-%d", lanPort)); err != nil {
+			lastErr = err
+			pluginLog.Printf("[GetInstance] 映射端口失败，换端口重试 hs=%s vm=%s lan=%d wan=%d: %v",
+				hsName, vmUUID, lanPort, wanPort, err)
+			continue
+		}
+		pluginLog.Printf("[GetInstance] 自动映射端口成功 hs=%s vm=%s lan=%d wan=%d", hsName, vmUUID, lanPort, wanPort)
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available port for lan %d", lanPort)
+	}
+	return lastErr
+}
+
 // isRetryableCreateError 判断创建失败是否属于可按原参数重试的偶发错误。
 // 镜像文件不存在、参数错误等确定性失败不重试。
 func isRetryableCreateError(detail string) bool {
@@ -922,22 +965,9 @@ func (a *automationServer) CreateInstance(ctx context.Context, req *pluginv1.Cre
 		lanPort = 22
 	}
 	if lanPort > 0 {
-		// 从可用端口列表中获取一个宿主机端口
-		wanPort := 0
-		avail, portErr := c.GetAvailablePorts(ctx, hsName)
-		if portErr == nil && len(avail.AvailablePorts) > 0 {
-			wanPort = int(avail.AvailablePorts[0])
-		}
-		if wanPort > 0 {
-			natErr := c.AddNATRule(ctx, hsName, vmUUID, wanPort, lanPort, "tcp", fmt.Sprintf("auto-remote-%d", lanPort))
-			if natErr != nil {
-				pluginLog.Printf("[CreateInstance] 自动映射端口失败 hs=%s vm=%s lan=%d wan=%d: %v", hsName, vmUUID, lanPort, wanPort, natErr)
-			} else {
-				pluginLog.Printf("[CreateInstance] 自动映射端口成功 hs=%s vm=%s lan=%d wan=%d", hsName, vmUUID, lanPort, wanPort)
-			}
-		} else {
-			pluginLog.Printf("[CreateInstance] 无可用宿主机端口，跳过自动映射 hs=%s vm=%s", hsName, vmUUID)
-		}
+		// 创建是异步任务，此刻 VM 尚未纳管，natadd 会返回"虚拟机不存在"；
+		// 先登记待映射端口，等 GetInstance 首次确认 VM 存在后再执行。
+		pendingNAT.Store(a.core.ids.instanceID(hsName, vmUUID), pendingNATRule{lanPort: lanPort})
 	}
 
 	instanceID := a.core.ids.instanceID(hsName, vmUUID)
@@ -1032,6 +1062,19 @@ func (a *automationServer) GetInstance(ctx context.Context, req *pluginv1.GetIns
 	instanceID := a.core.ids.instanceID(hsName, info.VMUUID)
 	// VM 已就绪，创建成功，清理失败重试登记。
 	clearPendingCreate(req.GetInstanceId())
+
+	// 自动端口映射：VM 已纳管后 natadd 才会成功，最多尝试 3 轮。
+	if v, ok := pendingNAT.LoadAndDelete(instanceID); ok {
+		rule := v.(pendingNATRule)
+		if err := ensureNATRule(ctx, c, hsName, info.VMUUID, rule.lanPort); err != nil {
+			rule.attempts++
+			pluginLog.Printf("[GetInstance] 自动映射端口失败 hs=%s vm=%s lan=%d (第%d次): %v",
+				hsName, info.VMUUID, rule.lanPort, rule.attempts, err)
+			if rule.attempts < 3 {
+				pendingNAT.Store(instanceID, rule)
+			}
+		}
+	}
 
 	// 开通后的首次自动开机：只有 CreateInstance 登记过的实例才会执行一次，
 	// 用户后续手动关机不会被重新拉起。

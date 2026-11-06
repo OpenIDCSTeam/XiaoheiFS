@@ -26,6 +26,98 @@ var pluginLog *log.Logger
 // 因此自动开机推迟到 GetInstance 首次确认 VM 存在时执行，且只执行一次。
 var pendingAutoStart sync.Map // map[int64]struct{}
 
+// 创建失败的自动重试策略。
+// 上游创建是异步任务，context canceled / timeout / 连接中断等属于偶发链路问题，
+// 同一份创建参数重新提交即可，不必让整单直接失败。
+const (
+	maxCreateRetries    = 3
+	createRetryInterval = 15 * time.Second
+)
+
+// pendingCreate 保存一次创建请求的原始参数，供失败后重试使用。
+type pendingCreate struct {
+	hsName    string
+	vmName    string
+	body      map[string]any
+	attempts  int
+	nextRetry time.Time
+}
+
+var (
+	pendingCreateMu sync.Mutex
+	pendingCreates  = make(map[int64]*pendingCreate)
+)
+
+// rememberPendingCreate 登记创建参数，等待可能的自动重试。
+func rememberPendingCreate(instanceID int64, hsName, vmName string, body map[string]any) {
+	pendingCreateMu.Lock()
+	pendingCreates[instanceID] = &pendingCreate{
+		hsName: hsName,
+		vmName: vmName,
+		body:   body,
+	}
+	pendingCreateMu.Unlock()
+}
+
+// clearPendingCreate 在实例就绪或最终失败后清理登记信息。
+func clearPendingCreate(instanceID int64) {
+	pendingCreateMu.Lock()
+	delete(pendingCreates, instanceID)
+	pendingCreateMu.Unlock()
+}
+
+// retryPendingCreate 判断是否需要并执行一次创建重试。
+// 返回 true 表示调用方应继续返回 state=0：已重新提交，或仍在重试等待窗口内。
+// 返回 false 表示不可重试、无登记信息或重试次数已用尽，应上报最终失败。
+func retryPendingCreate(ctx context.Context, c *Client, instanceID int64, detail string) bool {
+	if !isRetryableCreateError(detail) {
+		return false
+	}
+	pendingCreateMu.Lock()
+	defer pendingCreateMu.Unlock()
+	pc, ok := pendingCreates[instanceID]
+	if !ok || pc.attempts >= maxCreateRetries {
+		return false
+	}
+	if time.Now().Before(pc.nextRetry) {
+		return true
+	}
+	pc.attempts++
+	pc.nextRetry = time.Now().Add(createRetryInterval)
+	pluginLog.Printf("[GetInstance] 创建失败自动重试(%d/%d) hs=%s vm=%s: %s",
+		pc.attempts, maxCreateRetries, pc.hsName, pc.vmName, detail)
+	if _, err := c.CreateVM(ctx, pc.hsName, pc.vmName, pc.body); err != nil {
+		pluginLog.Printf("[GetInstance] 重试提交失败 hs=%s vm=%s: %v", pc.hsName, pc.vmName, err)
+	}
+	return true
+}
+
+// isRetryableCreateError 判断创建失败是否属于可按原参数重试的偶发错误。
+// 镜像文件不存在、参数错误等确定性失败不重试。
+func isRetryableCreateError(detail string) bool {
+	m := strings.ToLower(detail)
+	for _, kw := range []string{
+		"context canceled",
+		"context deadline exceeded",
+		"timeout",
+		"timed out",
+		"connection refused",
+		"connection reset",
+		"broken pipe",
+		"i/o timeout",
+		"temporarily unavailable",
+		"bad gateway",
+		"service unavailable",
+		"gateway timeout",
+		"eof",
+	} {
+		if strings.Contains(m, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 func initLogger() {
 	f, err := os.OpenFile("plugin.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
@@ -849,6 +941,9 @@ func (a *automationServer) CreateInstance(ctx context.Context, req *pluginv1.Cre
 	}
 
 	instanceID := a.core.ids.instanceID(hsName, vmUUID)
+	// 保存创建参数：异步任务失败（context canceled/timeout 等偶发问题）时，
+	// GetInstance 会用同一份参数重新提交，避免整单直接失败。
+	rememberPendingCreate(instanceID, hsName, req.GetName(), body)
 	// 创建是异步任务，此刻 VM 可能还不存在，不能立即调用 /api/client/powers：
 	// 上游 CloudHost 会把电源请求的 ctx 绑定到该 vm_uuid，覆盖创建任务绑定的 ctx，
 	// 电源请求返回后 ctx 即被取消，正在执行的 PVE 创建请求就会报 context canceled。
@@ -890,7 +985,18 @@ func (a *automationServer) GetInstance(ctx context.Context, req *pluginv1.GetIns
 			// 创建失败（如镜像文件不存在）只记录在任务状态里，VM 侧不会出现。
 			// 不回查的话只能一直返回 state=0，平台要等 watchdog 超时才失败。
 			if failed, detail := probeVMCreateFailure(ctx, c, hsName, vmUUID); failed {
+				// 偶发链路错误（context canceled / timeout / 连接中断）用原参数自动重试，
+				// 期间继续返回 state=0；确定性失败（镜像不存在、参数错误）才上报失败。
+				if retryPendingCreate(ctx, c, req.GetInstanceId(), detail) {
+					return &pluginv1.GetInstanceResponse{
+						Instance: &pluginv1.AutomationInstance{
+							Id:    req.GetInstanceId(),
+							State: 0,
+						},
+					}, nil
+				}
 				pluginLog.Printf("[GetInstance] 上游创建任务已失败 hs=%s vm=%s: %s", hsName, vmUUID, detail)
+				clearPendingCreate(req.GetInstanceId())
 				return &pluginv1.GetInstanceResponse{
 					Instance: &pluginv1.AutomationInstance{
 						Id:    req.GetInstanceId(),
@@ -924,6 +1030,8 @@ func (a *automationServer) GetInstance(ctx context.Context, req *pluginv1.GetIns
 		state = 10
 	}
 	instanceID := a.core.ids.instanceID(hsName, info.VMUUID)
+	// VM 已就绪，创建成功，清理失败重试登记。
+	clearPendingCreate(req.GetInstanceId())
 
 	// 开通后的首次自动开机：只有 CreateInstance 登记过的实例才会执行一次，
 	// 用户后续手动关机不会被重新拉起。

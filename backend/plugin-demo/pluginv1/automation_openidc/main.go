@@ -865,6 +865,18 @@ func (a *automationServer) GetInstance(ctx context.Context, req *pluginv1.GetIns
 			}
 		}
 		if err != nil {
+			// VM 查不到时回查上游创建任务：create 是异步接口，
+			// 创建失败（如镜像文件不存在）只记录在任务状态里，VM 侧不会出现。
+			// 不回查的话只能一直返回 state=0，平台要等 watchdog 超时才失败。
+			if failed, detail := probeVMCreateFailure(ctx, c, hsName, vmUUID); failed {
+				pluginLog.Printf("[GetInstance] 上游创建任务已失败 hs=%s vm=%s: %s", hsName, vmUUID, detail)
+				return &pluginv1.GetInstanceResponse{
+					Instance: &pluginv1.AutomationInstance{
+						Id:    req.GetInstanceId(),
+						State: 11, // 11 = 开通失败，provision_worker 会立即把订单置为 failed
+					},
+				}, nil
+			}
 			// VM 尚未就绪，返回 state=0，provision_worker 继续轮询
 			return &pluginv1.GetInstanceResponse{
 				Instance: &pluginv1.AutomationInstance{
@@ -920,6 +932,34 @@ func (a *automationServer) GetInstance(ctx context.Context, req *pluginv1.GetIns
 			RemoteIp: remoteAddr,
 		},
 	}, nil
+}
+
+// probeVMCreateFailure 检查上游是否已把该 VM 的创建任务判为失败。
+// 返回 (true, 失败原因) 表示任务已处于 failed/stopped/cancelled 终态。
+// 老版本主控没有任务接口时返回 (false, "")，降级为原有轮询行为。
+func probeVMCreateFailure(ctx context.Context, c *Client, hsName, vmUUID string) (bool, string) {
+	tasks, err := c.ListVMTasks(ctx, hsName, vmUUID)
+	if err != nil {
+		pluginLog.Printf("[GetInstance] 查询创建任务失败 hs=%s vm=%s: %v", hsName, vmUUID, err)
+		return false, ""
+	}
+	if len(tasks) == 0 {
+		return false, ""
+	}
+	// 接口按 created_at 倒序，第一条即最近一次创建任务
+	t := tasks[0]
+	switch strings.ToLower(strings.TrimSpace(t.Status)) {
+	case "failed", "stopped", "cancelled":
+		detail := strings.TrimSpace(t.Error)
+		if detail == "" {
+			detail = strings.TrimSpace(t.Message)
+		}
+		if detail == "" {
+			detail = "task status=" + t.Status
+		}
+		return true, detail
+	}
+	return false, ""
 }
 
 // ListInstancesSimple 简易实例搜索（遍历所有主机下的虚拟机）

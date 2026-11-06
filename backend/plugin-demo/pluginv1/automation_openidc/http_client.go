@@ -472,6 +472,46 @@ func (c *Client) GetAvailablePorts(ctx context.Context, hsName string) (Availabl
 
 // ---- 虚拟机管理 ----
 
+// VMTask 上游异步任务摘要（CloudHost /api/system/async_task/list）
+// 仅保留判断创建结果所需字段。
+type VMTask struct {
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	Status      string `json:"status"` // pending / running / completed / failed / stopped / cancelled
+	Progress    int    `json:"progress"`
+	Message     string `json:"message"`
+	Error       string `json:"error"`
+	HsName      string `json:"hs_name"`
+	VmUUID      string `json:"vm_uuid"`
+	CreatedAt   string `json:"created_at"`
+	CompletedAt string `json:"completed_at"`
+}
+
+// ListVMTasks 查询指定主机 + 虚拟机的创建任务，按创建时间倒序返回。
+//
+// 背景：CloudHost 的 /api/client/create/{hs} 是异步接口，只返回 task_id；
+// 创建失败（例如镜像文件不存在）只会体现在任务状态里，VM 侧根本不会出现。
+// 不查任务的话，插件只能一直返回 state=0，平台要等到 watchdog 超时才失败。
+func (c *Client) ListVMTasks(ctx context.Context, hsName, vmUUID string) ([]VMTask, error) {
+	q := url.Values{}
+	q.Set("hs_name", hsName)
+	q.Set("vm_uuid", vmUUID)
+	q.Set("task_type", "create_vm")
+	q.Set("page_size", "5")
+
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/system/async_task/list?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Items []VMTask `json:"items"`
+	}
+	if err := json.Unmarshal(resp.Data, &payload); err != nil {
+		return nil, fmt.Errorf("decode task list: %w", err)
+	}
+	return payload.Items, nil
+}
+
 // ListVMs 获取指定主机的虚拟机列表
 // 兼容 HostAgent 两种返回格式：
 //   - array 形态（新版）：[ { "vm_uuid": "...", "vm_name": "...", ... } ]

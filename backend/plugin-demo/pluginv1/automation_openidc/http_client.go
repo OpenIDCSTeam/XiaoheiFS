@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1246,172 +1247,633 @@ func (c *Client) DeleteBackup(ctx context.Context, hsName, vmUUID, backupName st
 
 // ---- 快照管理 ----
 //
-// HostAgent 没有独立的快照 API，"快照" 功能通过备份（backup）接口实现。
-// ListSnapshots / CreateSnapshot / RestoreSnapshot / DeleteSnapshot 均映射到
-// /api/client/backup/* 接口，对外保持 SnapshotInfo 的字段形态不变。
+// 直接对接主控的虚拟机快照 API（/api/client/snapshot/*），
+// 与备份（/api/client/backup/*）是两套独立语义：
+//   - 快照：平台原生快照树，可秒级回滚，不产生备份文件
+//   - 备份：vzdump / 导出产物，独立存储介质
+// 平台不具备快照能力时主控返回 400「当前虚拟化平台不支持虚拟机快照」，
+// 上层据 errUnsupportedPlatform 转成 gRPC Unimplemented，便于宿主下发 501。
 
-// SnapshotInfo 快照信息（由 backup 数据适配而来）
+// SnapshotInfo 快照信息
 type SnapshotInfo struct {
 	SnapshotName string `json:"snapshot_name"`
 	Description  string `json:"description"`
-	SizeMB       int    `json:"size_mb"`
+	Parent       string `json:"parent"`
 	CreatedTime  string `json:"created_time"`
-	CreatedBy    string `json:"created_by"`
-	VMState      string `json:"vm_state"`
+	State        string `json:"state"`
+	Current      bool   `json:"current"`
 }
 
-// backupRawInfo HostAgent backup 接口返回的原始字段
-type backupRawInfo struct {
-	BackupName  string `json:"backup_name"`
-	BackupHint  string `json:"backup_hint"`
-	BackupPath  string `json:"backup_path"`
-	BackupTime  int64  `json:"backup_time"`
-	CreatedTime string `json:"created_time"`
-	SizeMB      int    `json:"size_mb"`
-	CreatedBy   string `json:"created_by"`
-	VMState     string `json:"vm_state"`
+// snapshotRawInfo 主控 /api/client/snapshot 返回的原始字段
+type snapshotRawInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parent      string `json:"parent"`
+	CreatedAt   int64  `json:"created_at"`
+	State       string `json:"state"`
+	Current     bool   `json:"current"`
 }
 
-// ListSnapshots 获取快照列表（映射 backup 列表）
+// ListSnapshots 获取快照列表
 func (c *Client) ListSnapshots(ctx context.Context, hsName, vmUUID string) ([]SnapshotInfo, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/backup/detail/"+hsName+"/"+vmUUID, nil)
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/snapshot/"+hsName+"/"+vmUUID, nil)
 	if err != nil {
 		return nil, err
 	}
-	// 兼容两种返回结构：
-	//   1) 直接是数组：[{backup_name: ...}, ...]
-	//   2) 对象包裹：{"backups": [...]} 或 {"config": {"backups": [...]}}
-	var raws []backupRawInfo
-	if len(resp.Data) > 0 && resp.Data[0] == '[' {
+	var raws []snapshotRawInfo
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
 		if err := json.Unmarshal(resp.Data, &raws); err != nil {
-			return nil, fmt.Errorf("decode backups: %w", err)
-		}
-	} else {
-		var wrap struct {
-			Backups []backupRawInfo `json:"backups"`
-			Config  struct {
-				Backups []backupRawInfo `json:"backups"`
-			} `json:"config"`
-		}
-		if err := json.Unmarshal(resp.Data, &wrap); err != nil {
-			return nil, fmt.Errorf("decode backups: %w", err)
-		}
-		if len(wrap.Backups) > 0 {
-			raws = wrap.Backups
-		} else {
-			raws = wrap.Config.Backups
+			return nil, fmt.Errorf("decode snapshots: %w", err)
 		}
 	}
 	out := make([]SnapshotInfo, 0, len(raws))
 	for _, r := range raws {
-		created := r.CreatedTime
-		if created == "" && r.BackupTime > 0 {
-			created = time.Unix(r.BackupTime, 0).Format(time.RFC3339)
+		created := ""
+		if r.CreatedAt > 0 {
+			created = time.Unix(r.CreatedAt, 0).Format(time.RFC3339)
 		}
 		out = append(out, SnapshotInfo{
-			SnapshotName: r.BackupName,
-			Description:  r.BackupHint,
-			SizeMB:       r.SizeMB,
+			SnapshotName: r.Name,
+			Description:  r.Description,
+			Parent:       r.Parent,
 			CreatedTime:  created,
-			CreatedBy:    r.CreatedBy,
-			VMState:      r.VMState,
+			State:        r.State,
+			Current:      r.Current,
 		})
 	}
 	return out, nil
 }
 
-// CreateSnapshot 创建快照（映射为创建 backup）
+// CreateSnapshot 创建快照
 func (c *Client) CreateSnapshot(ctx context.Context, hsName, vmUUID, snapshotName, description string) error {
-	body := map[string]any{}
-	// HostAgent 创建 backup 使用 vm_tips 作为备份说明
-	tips := description
-	if tips == "" {
-		tips = snapshotName
+	body := map[string]any{
+		"name":        strings.TrimSpace(snapshotName),
+		"description": strings.TrimSpace(description),
 	}
-	if tips == "" {
-		tips = "快照 " + time.Now().Format("2006-01-02 15:04:05")
-	}
-	body["vm_tips"] = tips
-	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/backup/create/"+hsName+"/"+vmUUID, body)
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/snapshot/"+hsName+"/"+vmUUID, body)
 	return err
 }
 
-// RestoreSnapshot 恢复快照（映射为恢复 backup）
+// RestoreSnapshot 回滚到指定快照
 func (c *Client) RestoreSnapshot(ctx context.Context, hsName, vmUUID, snapshotName string) error {
-	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/backup/restore/"+hsName+"/"+vmUUID, map[string]any{
-		"vm_back": snapshotName,
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/snapshot/"+hsName+"/"+vmUUID+"/restore", map[string]any{
+		"name": snapshotName,
 	})
 	return err
 }
 
-// DeleteSnapshot 删除快照（映射为删除 backup）
+// DeleteSnapshot 删除指定快照（快照名走 query，主控侧避免路径字符冲突）
 func (c *Client) DeleteSnapshot(ctx context.Context, hsName, vmUUID, snapshotName string) error {
-	_, err := c.doRequest(ctx, http.MethodDelete, "/api/client/backup/delete/"+hsName+"/"+vmUUID, map[string]any{
-		"vm_back": snapshotName,
-	})
+	path := "/api/client/snapshot/" + hsName + "/" + vmUUID + "?name=" + url.QueryEscape(snapshotName)
+	_, err := c.doRequest(ctx, http.MethodDelete, path, nil)
 	return err
 }
 
 // ---- 防火墙管理 ----
 //
-// HostAgent 没有独立的防火墙 API，"防火墙" 功能通过 NAT 转发规则实现。
-// ListFirewallRules / AddFirewallRule / DeleteFirewallRule 均映射到已有的 NAT API，
-// 将 NAT 规则适配为前端防火墙表格期望的字段格式（direction / protocol / method / port / ip / priority）。
+// 对接主控的虚拟机防火墙 API（/api/client/firewall/*），
+// 规则语义与 PVE firewall/rules 对齐：
+//   direction = type（in/out），method = action（ACCEPT/DROP/REJECT），
+//   protocol = proto，ip = source，port = dport，priority = pos（平台位序）。
+// 平台支持情况由主控判定（PVE / Hyper-V 支持，其余返回不支持）。
 
-// FirewallRule 防火墙规则（由 NAT 规则适配而来）
+// FirewallRule 防火墙规则
 type FirewallRule struct {
-	RuleID    int    `json:"rule_id"`
-	Direction string `json:"direction"` // In（NAT 转发默认入站）
-	Protocol  string `json:"protocol"`  // tcp / udp
-	Method    string `json:"method"`    // allowed（NAT 转发默认允许）
-	Port      string `json:"port"`      // 映射端口，格式 "host_port → vm_port"
-	IP        string `json:"ip"`        // 0.0.0.0（NAT 转发不限制来源 IP）
-	Priority  int    `json:"priority"`  // 优先级（NAT 规则无此概念，默认 100）
+	RuleID    int    `json:"rule_id"`   // 平台位序 pos
+	Direction string `json:"direction"` // in / out
+	Protocol  string `json:"protocol"`  // tcp / udp / icmp / 空=任意
+	Method    string `json:"method"`    // ACCEPT / DROP / REJECT
+	Port      string `json:"port"`      // 目的端口，支持 "80" / "8000:9000"
+	IP        string `json:"ip"`        // 来源地址/CIDR，空=任意
+	Priority  int    `json:"priority"`  // 位序（与 RuleID 一致，便于前端排序展示）
+	Enable    bool   `json:"enable"`
+	Dest      string `json:"dest"`
+	Sport     string `json:"sport"`
+	Comment   string `json:"comment"`
+	Macro     string `json:"macro"`
+	Iface     string `json:"iface"`
 }
 
-// ListFirewallRules 获取防火墙规则列表（映射 NAT 转发规则）
-// publicIP 为主机公网 IP，用于填充防火墙规则的 IP 字段；为空时回退到 "0.0.0.0"。
-func (c *Client) ListFirewallRules(ctx context.Context, hsName, vmUUID, publicIP string) ([]FirewallRule, error) {
-	natRules, err := c.ListNATRules(ctx, hsName, vmUUID)
+// FirewallState 虚拟机防火墙整体状态
+type FirewallState struct {
+	Enabled        bool  `json:"enabled"`
+	PolicyIn       string `json:"policy_in"`
+	PolicyOut      string `json:"policy_out"`
+	ClusterEnabled *bool `json:"cluster_enabled"`
+	NodeEnabled    *bool `json:"node_enabled"`
+	Effective      bool  `json:"effective"`
+	Platform       string `json:"platform"`
+}
+
+// firewallRulePayload 主控防火墙规则 JSON
+type firewallRulePayload struct {
+	Pos     int    `json:"pos"`
+	Type    string `json:"type"`
+	Action  string `json:"action"`
+	Enable  bool   `json:"enable"`
+	Proto   string `json:"proto"`
+	Source  string `json:"source"`
+	Dest    string `json:"dest"`
+	Sport   string `json:"sport"`
+	Dport   string `json:"dport"`
+	Comment string `json:"comment"`
+	Macro   string `json:"macro"`
+	Iface   string `json:"iface"`
+}
+
+// toFirewallRule 把主控规则转换为插件规则
+func (r firewallRulePayload) toFirewallRule() FirewallRule {
+	return FirewallRule{
+		RuleID:    r.Pos,
+		Direction: r.Type,
+		Protocol:  r.Proto,
+		Method:    r.Action,
+		Port:      r.Dport,
+		IP:        r.Source,
+		Priority:  r.Pos,
+		Enable:    r.Enable,
+		Dest:      r.Dest,
+		Sport:     r.Sport,
+		Comment:   r.Comment,
+		Macro:     r.Macro,
+		Iface:     r.Iface,
+	}
+}
+
+// toPayload 把插件规则转换为主控请求体
+func (r FirewallRule) toPayload() map[string]any {
+	body := map[string]any{
+		"type":    strings.TrimSpace(r.Direction),
+		"action":  strings.TrimSpace(r.Method),
+		"enable":  r.Enable,
+		"proto":   strings.TrimSpace(r.Protocol),
+		"source":  strings.TrimSpace(r.IP),
+		"dest":    strings.TrimSpace(r.Dest),
+		"sport":   strings.TrimSpace(r.Sport),
+		"dport":   strings.TrimSpace(r.Port),
+		"comment": strings.TrimSpace(r.Comment),
+		"macro":   strings.TrimSpace(r.Macro),
+		"iface":   strings.TrimSpace(r.Iface),
+	}
+	return body
+}
+
+// ListFirewallRules 获取防火墙状态与规则列表
+func (c *Client) ListFirewallRules(ctx context.Context, hsName, vmUUID string) ([]FirewallRule, *FirewallState, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/firewall/"+hsName+"/"+vmUUID, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	var payload struct {
+		State *FirewallState        `json:"state"`
+		Rules []firewallRulePayload `json:"rules"`
+	}
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
+		if err := json.Unmarshal(resp.Data, &payload); err != nil {
+			return nil, nil, fmt.Errorf("decode firewall: %w", err)
+		}
+	}
+	out := make([]FirewallRule, 0, len(payload.Rules))
+	for _, r := range payload.Rules {
+		out = append(out, r.toFirewallRule())
+	}
+	return out, payload.State, nil
+}
+
+// AddFirewallRule 新增防火墙规则
+func (c *Client) AddFirewallRule(ctx context.Context, hsName, vmUUID string, rule FirewallRule) error {
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/firewall/"+hsName+"/"+vmUUID+"/rules", rule.toPayload())
+	return err
+}
+
+// UpdateFirewallRule 按平台位序更新防火墙规则
+func (c *Client) UpdateFirewallRule(ctx context.Context, hsName, vmUUID string, ruleID int, rule FirewallRule) error {
+	path := fmt.Sprintf("/api/client/firewall/%s/%s/rules/%d", hsName, vmUUID, ruleID)
+	_, err := c.doRequest(ctx, http.MethodPut, path, rule.toPayload())
+	return err
+}
+
+// DeleteFirewallRule 按平台位序删除防火墙规则
+func (c *Client) DeleteFirewallRule(ctx context.Context, hsName, vmUUID string, ruleID int) error {
+	path := fmt.Sprintf("/api/client/firewall/%s/%s/rules/%d", hsName, vmUUID, ruleID)
+	_, err := c.doRequest(ctx, http.MethodDelete, path, nil)
+	return err
+}
+
+// SetFirewallOptions 保存防火墙开关与默认策略
+func (c *Client) SetFirewallOptions(ctx context.Context, hsName, vmUUID string, enable bool, policyIn, policyOut string) error {
+	body := map[string]any{"enable": enable}
+	if v := strings.TrimSpace(policyIn); v != "" {
+		body["policy_in"] = v
+	}
+	if v := strings.TrimSpace(policyOut); v != "" {
+		body["policy_out"] = v
+	}
+	_, err := c.doRequest(ctx, http.MethodPut, "/api/client/firewall/"+hsName+"/"+vmUUID+"/options", body)
+	return err
+}
+
+// ---- 网卡管理 ----
+
+// NetworkCard 网卡配置
+type NetworkCard struct {
+	NicName   string   `json:"nic_name"`
+	NicType   string   `json:"nic_type"`
+	MacAddr   string   `json:"mac_addr"`
+	IP4Addr   string   `json:"ip4_addr"`
+	IP6Addr   string   `json:"ip6_addr"`
+	NicGate   string   `json:"nic_gate"`
+	NicMask   string   `json:"nic_mask"`
+	DNSAddr   []string `json:"dns_addr"`
+	IP6Prefix int      `json:"ip6_prefix"`
+}
+
+// ListNetworkCards 获取网卡列表（主控返回 map[nic_name]NCConfig）
+func (c *Client) ListNetworkCards(ctx context.Context, hsName, vmUUID string) ([]NetworkCard, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/ipaddr/detail/"+hsName+"/"+vmUUID, nil)
 	if err != nil {
 		return nil, err
 	}
-	if publicIP == "" {
-		publicIP = "0.0.0.0"
+	cards := make(map[string]NetworkCard)
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
+		if err := json.Unmarshal(resp.Data, &cards); err != nil {
+			return nil, fmt.Errorf("decode network cards: %w", err)
+		}
 	}
-	out := make([]FirewallRule, 0, len(natRules))
-	for _, r := range natRules {
-		out = append(out, FirewallRule{
-			RuleID:    r.RuleIndex,
-			Direction: "In",
-			Protocol:  "tcp",
-			Method:    "allowed",
-			Port:      fmt.Sprintf("%d → %d", r.WanPort, r.LanPort),
-			IP:        publicIP,
-			Priority:  100,
-		})
+	names := make([]string, 0, len(cards))
+	for name := range cards {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]NetworkCard, 0, len(names))
+	for _, name := range names {
+		card := cards[name]
+		if card.NicName == "" {
+			card.NicName = name
+		}
+		out = append(out, card)
 	}
 	return out, nil
 }
 
-// AddFirewallRule 添加防火墙规则（映射为添加 NAT 转发规则）
-// 前端传入的 port 字段作为 vm_port（目标端口），host_port 设为 0 让 HostAgent 自动分配。
-func (c *Client) AddFirewallRule(ctx context.Context, hsName, vmUUID string, rule FirewallRule) error {
-	vmPort := 0
-	fmt.Sscanf(rule.Port, "%d", &vmPort)
-	if vmPort <= 0 {
-		return fmt.Errorf("invalid port: %s", rule.Port)
-	}
-	protocol := rule.Protocol
-	if protocol == "" || protocol == "all" {
-		protocol = "tcp"
-	}
-	return c.AddNATRule(ctx, hsName, vmUUID, 0, vmPort, protocol, "firewall-rule")
+// CreateNetworkCard 新增网卡
+func (c *Client) CreateNetworkCard(ctx context.Context, hsName, vmUUID string, card NetworkCard) error {
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/ipaddr/create/"+hsName+"/"+vmUUID, card)
+	return err
 }
 
-// DeleteFirewallRule 删除防火墙规则（映射为删除 NAT 转发规则）
-func (c *Client) DeleteFirewallRule(ctx context.Context, hsName, vmUUID string, ruleID int) error {
-	return c.DeleteNATRule(ctx, hsName, vmUUID, ruleID)
+// UpdateNetworkCard 更新网卡
+func (c *Client) UpdateNetworkCard(ctx context.Context, hsName, vmUUID, nicName string, card NetworkCard) error {
+	card.NicName = nicName
+	path := "/api/hosts/" + hsName + "/vms/" + vmUUID + "/ip_addresses/" + url.PathEscape(nicName)
+	_, err := c.doRequest(ctx, http.MethodPut, path, card)
+	return err
+}
+
+// DeleteNetworkCard 删除网卡
+func (c *Client) DeleteNetworkCard(ctx context.Context, hsName, vmUUID, nicName string) error {
+	path := "/api/hosts/" + hsName + "/vms/" + vmUUID + "/ip_addresses/" + url.PathEscape(nicName)
+	_, err := c.doRequest(ctx, http.MethodDelete, path, nil)
+	return err
+}
+
+// ---- 数据盘管理 ----
+
+// DataDisk 数据盘配置
+type DataDisk struct {
+	HddName string `json:"hdd_name"`
+	HddSize int    `json:"hdd_size"`
+	HddFlag int    `json:"hdd_flag"`
+	HddType int    `json:"hdd_type"`
+	HddPath string `json:"hdd_path"`
+	HddScsi string `json:"hdd_scsi"`
+}
+
+// ListDataDisks 获取数据盘列表（主控返回 map[hdd_name]SDConfig）
+func (c *Client) ListDataDisks(ctx context.Context, hsName, vmUUID string) ([]DataDisk, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/hdd/detail/"+hsName+"/"+vmUUID, nil)
+	if err != nil {
+		return nil, err
+	}
+	disks := make(map[string]DataDisk)
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
+		if err := json.Unmarshal(resp.Data, &disks); err != nil {
+			return nil, fmt.Errorf("decode data disks: %w", err)
+		}
+	}
+	names := make([]string, 0, len(disks))
+	for name := range disks {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]DataDisk, 0, len(names))
+	for _, name := range names {
+		disk := disks[name]
+		if disk.HddName == "" {
+			disk.HddName = name
+		}
+		out = append(out, disk)
+	}
+	return out, nil
+}
+
+// AttachDataDisk 挂载数据盘（hdd_size 单位 MB）
+func (c *Client) AttachDataDisk(ctx context.Context, hsName, vmUUID string, sizeMB, hddType int) error {
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/hdd/mount/"+hsName+"/"+vmUUID, map[string]any{
+		"hdd_size": sizeMB,
+		"hdd_type": hddType,
+	})
+	return err
+}
+
+// DetachDataDisk 卸载数据盘（保留磁盘）
+func (c *Client) DetachDataDisk(ctx context.Context, hsName, vmUUID, hddName string) error {
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/hdd/unmount/"+hsName+"/"+vmUUID, map[string]any{
+		"hdd_name": hddName,
+	})
+	return err
+}
+
+// DeleteDataDisk 删除数据盘
+func (c *Client) DeleteDataDisk(ctx context.Context, hsName, vmUUID, hddName string) error {
+	_, err := c.doRequest(ctx, http.MethodDelete, "/api/client/hdd/delete/"+hsName+"/"+vmUUID, map[string]any{
+		"hdd_name": hddName,
+	})
+	return err
+}
+
+// ---- 光盘管理 ----
+
+// ISOInfo 光盘配置
+type ISOInfo struct {
+	IsoName string `json:"iso_name"`
+	IsoFile string `json:"iso_file"`
+	IsoPath string `json:"iso_path"`
+	IsoHint string `json:"iso_hint"`
+}
+
+// ListISOs 获取已挂载光盘列表（主控返回 map[iso_name]IMConfig）
+func (c *Client) ListISOs(ctx context.Context, hsName, vmUUID string) ([]ISOInfo, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/isos/detail/"+hsName+"/"+vmUUID, nil)
+	if err != nil {
+		return nil, err
+	}
+	isos := make(map[string]ISOInfo)
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
+		if err := json.Unmarshal(resp.Data, &isos); err != nil {
+			return nil, fmt.Errorf("decode isos: %w", err)
+		}
+	}
+	names := make([]string, 0, len(isos))
+	for name := range isos {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]ISOInfo, 0, len(names))
+	for _, name := range names {
+		iso := isos[name]
+		if iso.IsoName == "" {
+			iso.IsoName = name
+		}
+		out = append(out, iso)
+	}
+	return out, nil
+}
+
+// MountISOImage 挂载光盘。
+// 与既有 MountISO（只下发 iso_name）不同，这里按主控 IMConfig 语义下发镜像文件，
+// 名称由主控自动生成，便于同一虚拟机挂载多张光驱。
+func (c *Client) MountISOImage(ctx context.Context, hsName, vmUUID, isoFile, isoPath, isoHint string) error {
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/iso/mount/"+hsName+"/"+vmUUID, map[string]any{
+		"iso_file": isoFile,
+		"iso_path": isoPath,
+		"iso_hint": isoHint,
+	})
+	return err
+}
+
+// UnmountISO 卸载光盘
+func (c *Client) UnmountISO(ctx context.Context, hsName, vmUUID, isoName string) error {
+	path := "/api/client/iso/unmount/" + hsName + "/" + vmUUID + "/" + url.PathEscape(isoName)
+	_, err := c.doRequest(ctx, http.MethodDelete, path, nil)
+	return err
+}
+
+// ListHostISOImages 获取主机可挂载的 ISO 镜像名列表（供光盘挂载下拉选择）
+func (c *Client) ListHostISOImages(ctx context.Context, hsName string) ([]string, error) {
+	images, err := c.ListOSImages(ctx, hsName)
+	if err != nil {
+		return nil, err
+	}
+	list := images["iso"]
+	out := make([]string, 0, len(list))
+	for _, img := range list {
+		file := strings.TrimSpace(img.File)
+		if file == "" {
+			continue
+		}
+		out = append(out, file)
+	}
+	return out, nil
+}
+
+// ---- 反向代理 ----
+
+// ReverseProxy 反向代理配置
+type ReverseProxy struct {
+	ProxyIndex  int    `json:"proxy_index"`
+	Domain      string `json:"domain"`
+	BackendIP   string `json:"backend_ip"`
+	BackendPort int    `json:"backend_port"`
+	SSLEnabled  bool   `json:"ssl_enabled"`
+	Description string `json:"description"`
+}
+
+// ListReverseProxies 获取反向代理列表
+func (c *Client) ListReverseProxies(ctx context.Context, hsName, vmUUID string) ([]ReverseProxy, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/proxys/detail/"+hsName+"/"+vmUUID, nil)
+	if err != nil {
+		return nil, err
+	}
+	var raws []ReverseProxy
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
+		if err := json.Unmarshal(resp.Data, &raws); err != nil {
+			return nil, fmt.Errorf("decode reverse proxies: %w", err)
+		}
+	}
+	return raws, nil
+}
+
+// CreateReverseProxy 新增反向代理
+func (c *Client) CreateReverseProxy(ctx context.Context, hsName, vmUUID string, proxy ReverseProxy) error {
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/proxys/create/"+hsName+"/"+vmUUID, map[string]any{
+		"domain":       proxy.Domain,
+		"backend_ip":   proxy.BackendIP,
+		"backend_port": proxy.BackendPort,
+		"ssl_enabled":  proxy.SSLEnabled,
+		"description":  proxy.Description,
+	})
+	return err
+}
+
+// UpdateReverseProxy 更新反向代理
+func (c *Client) UpdateReverseProxy(ctx context.Context, hsName, vmUUID string, proxyIndex int, proxy ReverseProxy) error {
+	path := fmt.Sprintf("/api/client/proxys/update/%s/%s/%d", hsName, vmUUID, proxyIndex)
+	_, err := c.doRequest(ctx, http.MethodPut, path, map[string]any{
+		"domain":       proxy.Domain,
+		"backend_ip":   proxy.BackendIP,
+		"backend_port": proxy.BackendPort,
+		"ssl_enabled":  proxy.SSLEnabled,
+		"description":  proxy.Description,
+	})
+	return err
+}
+
+// DeleteReverseProxy 删除反向代理
+func (c *Client) DeleteReverseProxy(ctx context.Context, hsName, vmUUID string, proxyIndex int) error {
+	path := fmt.Sprintf("/api/client/proxys/delete/%s/%s/%d", hsName, vmUUID, proxyIndex)
+	_, err := c.doRequest(ctx, http.MethodDelete, path, nil)
+	return err
+}
+
+// ---- 启动顺序 ----
+
+// BootOption 启动项
+type BootOption struct {
+	EfiType bool   `json:"efi_type"`
+	EfiName string `json:"efi_name"`
+}
+
+// GetBootOrder 获取启动顺序
+func (c *Client) GetBootOrder(ctx context.Context, hsName, vmUUID string) ([]BootOption, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/efi-list/"+hsName+"/"+vmUUID, nil)
+	if err != nil {
+		return nil, err
+	}
+	var items []BootOption
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
+		if err := json.Unmarshal(resp.Data, &items); err != nil {
+			return nil, fmt.Errorf("decode boot order: %w", err)
+		}
+	}
+	return items, nil
+}
+
+// SetBootOrder 保存启动顺序
+func (c *Client) SetBootOrder(ctx context.Context, hsName, vmUUID string, items []BootOption) error {
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/efi/setup/"+hsName+"/"+vmUUID, map[string]any{
+		"efi_list": items,
+	})
+	return err
+}
+
+// ---- PCI / USB 直通 ----
+
+// PCIDevice PCI 设备
+type PCIDevice struct {
+	PciKey  string `json:"pci_key"`
+	GpuUUID string `json:"gpu_uuid"`
+	GpuMdev string `json:"gpu_mdev"`
+	GpuHint string `json:"gpu_hint"`
+}
+
+// ListPCIDevices 获取主机可直通 PCI 设备列表
+func (c *Client) ListPCIDevices(ctx context.Context, hsName string) ([]PCIDevice, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/pci-list/"+hsName, nil)
+	if err != nil {
+		return nil, err
+	}
+	var items []PCIDevice
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
+		if err := json.Unmarshal(resp.Data, &items); err != nil {
+			return nil, fmt.Errorf("decode pci list: %w", err)
+		}
+	}
+	return items, nil
+}
+
+// SetupPCI 添加或移除 PCI 直通
+func (c *Client) SetupPCI(ctx context.Context, hsName, vmUUID string, device PCIDevice, add bool) error {
+	action := "remove"
+	if add {
+		action = "add"
+	}
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/pci/setup/"+hsName+"/"+vmUUID, map[string]any{
+		"pci_key":  device.PciKey,
+		"gpu_uuid": device.GpuUUID,
+		"gpu_mdev": device.GpuMdev,
+		"gpu_hint": device.GpuHint,
+		"action":   action,
+	})
+	return err
+}
+
+// USBDevice USB 设备
+type USBDevice struct {
+	UsbKey  string `json:"usb_key"`
+	VidUUID string `json:"vid_uuid"`
+	PidUUID string `json:"pid_uuid"`
+	UsbHint string `json:"usb_hint"`
+}
+
+// ListUSBDevices 获取主机可直通 USB 设备列表
+func (c *Client) ListUSBDevices(ctx context.Context, hsName string) ([]USBDevice, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/usb-list/"+hsName, nil)
+	if err != nil {
+		return nil, err
+	}
+	var items []USBDevice
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
+		if err := json.Unmarshal(resp.Data, &items); err != nil {
+			return nil, fmt.Errorf("decode usb list: %w", err)
+		}
+	}
+	return items, nil
+}
+
+// SetupUSB 添加或移除 USB 直通
+func (c *Client) SetupUSB(ctx context.Context, hsName, vmUUID string, device USBDevice, add bool) error {
+	action := "remove"
+	if add {
+		action = "add"
+	}
+	_, err := c.doRequest(ctx, http.MethodPost, "/api/client/usb/setup/"+hsName+"/"+vmUUID, map[string]any{
+		"usb_key":  device.UsbKey,
+		"vid_uuid": device.VidUUID,
+		"pid_uuid": device.PidUUID,
+		"usb_hint": device.UsbHint,
+		"action":   action,
+	})
+	return err
+}
+
+// ---- 平台能力 ----
+
+// PlatformCapabilities 主控下发的平台能力（/api/client/os-images/:hs_name）
+type PlatformCapabilities struct {
+	HotISO      bool `json:"hot_iso"`
+	HotNIC      bool `json:"hot_nic"`
+	OfflineOnly bool `json:"offline_only"`
+	Firewall    bool `json:"firewall"`
+	Snapshot    bool `json:"snapshot"`
+}
+
+// GetPlatformCapabilities 读取主机侧平台能力；失败时返回空能力（调用方按「不阻断」处理）
+func (c *Client) GetPlatformCapabilities(ctx context.Context, hsName string) (PlatformCapabilities, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/client/os-images/"+hsName, nil)
+	if err != nil {
+		return PlatformCapabilities{}, err
+	}
+	var payload struct {
+		ServerType   string               `json:"server_type"`
+		Capabilities PlatformCapabilities `json:"capabilities"`
+	}
+	if len(resp.Data) > 0 && string(resp.Data) != "null" {
+		if err := json.Unmarshal(resp.Data, &payload); err != nil {
+			return PlatformCapabilities{}, fmt.Errorf("decode platform capabilities: %w", err)
+		}
+	}
+	return payload.Capabilities, nil
 }
 
 // ---- 内部工具方法 ----

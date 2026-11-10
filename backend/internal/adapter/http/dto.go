@@ -73,6 +73,9 @@ type PlanGroupDTO struct {
 	Visible           bool    `json:"visible"`
 	CapacityRemaining int     `json:"capacity_remaining"`
 	SortOrder         int     `json:"sort_order"`
+	// FeatureFlags 线路级插件功能开关（仅包含被显式切换过的键）：
+	// true 强制开启，false 强制关闭并隐藏前端对应 tab，缺省表示跟随插件能力。
+	FeatureFlags map[string]bool `json:"feature_flags,omitempty"`
 }
 
 type PackageDTO struct {

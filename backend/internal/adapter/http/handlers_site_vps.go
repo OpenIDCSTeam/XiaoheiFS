@@ -403,6 +403,11 @@ func (h *Handler) applyPackageCapabilityPolicy(c *gin.Context, inst domain.VPSIn
 	if len(reasons) > 0 {
 		out.NotSupportedReasons = reasons
 	}
+	// 线路/附加项的功能开关是运营侧最终裁决，放在最后叠加，
+	// 保证「关闭后整个 tab 不显示」不会被插件声明或商品类型策略覆盖。
+	if flags := h.planGroupFeatureFlags(c, h.planGroupIDForInstance(c, inst)); len(flags) > 0 {
+		out = applyPlanGroupFeatureFlags(out, flags)
+	}
 	return out
 }
 

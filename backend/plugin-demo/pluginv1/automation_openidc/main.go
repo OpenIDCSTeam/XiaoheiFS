@@ -13,6 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"xiaoheiplay/pkg/pluginsdk"
 	pluginv1 "xiaoheiplay/plugin/v1"
 )
@@ -1816,11 +1819,17 @@ func (a *automationServer) ListSnapshots(ctx context.Context, req *pluginv1.List
 			Id:            int64(i),
 			Name:          s.SnapshotName,
 			CreatedAtUnix: createdAt,
-			State:         1,
+			State:         snapshotStateCreated,
+			Description:   s.Description,
+			Current:       s.Current,
+			PlatformState: s.State,
 		})
 	}
 	return &pluginv1.ListSnapshotsResponse{Items: out}, nil
 }
+
+// snapshotStateCreated 宿主/前端约定的「已创建」状态值。
+const snapshotStateCreated int32 = 2
 
 // CreateSnapshot 创建快照
 func (a *automationServer) CreateSnapshot(ctx context.Context, req *pluginv1.CreateSnapshotRequest) (*pluginv1.OperationResult, error) {
@@ -1835,8 +1844,8 @@ func (a *automationServer) CreateSnapshot(ctx context.Context, req *pluginv1.Cre
 	if err != nil {
 		return nil, err
 	}
-	if err := c.CreateSnapshot(ctx, hsName, vmUUID, "", ""); err != nil {
-		return nil, wrapHTTPTraceErr(err, last)
+	if err := c.CreateSnapshot(ctx, hsName, vmUUID, req.GetName(), req.GetDescription()); err != nil {
+		return nil, resourceErr(err, last)
 	}
 	return &pluginv1.OperationResult{Ok: true}, nil
 }
@@ -1865,7 +1874,7 @@ func (a *automationServer) DeleteSnapshot(ctx context.Context, req *pluginv1.Del
 		return nil, fmt.Errorf("snapshot index %d out of range (total: %d)", idx, len(snapshots))
 	}
 	if err := c.DeleteSnapshot(ctx, hsName, vmUUID, snapshots[idx].SnapshotName); err != nil {
-		return nil, wrapHTTPTraceErr(err, last)
+		return nil, resourceErr(err, last)
 	}
 	return &pluginv1.OperationResult{Ok: true}, nil
 }
@@ -1893,16 +1902,14 @@ func (a *automationServer) RestoreSnapshot(ctx context.Context, req *pluginv1.Re
 		return nil, fmt.Errorf("snapshot index %d out of range (total: %d)", idx, len(snapshots))
 	}
 	if err := c.RestoreSnapshot(ctx, hsName, vmUUID, snapshots[idx].SnapshotName); err != nil {
-		return nil, wrapHTTPTraceErr(err, last)
+		return nil, resourceErr(err, last)
 	}
 	return &pluginv1.OperationResult{Ok: true}, nil
 }
 
 // ---- 防火墙管理 ----
 
-// ListFirewallRules 获取防火墙规则列表
-
-// ListFirewallRules 获取防火墙规则列表
+// ListFirewallRules 获取防火墙状态与规则列表
 func (a *automationServer) ListFirewallRules(ctx context.Context, req *pluginv1.ListFirewallRulesRequest) (*pluginv1.ListFirewallRulesResponse, error) {
 	c, last, err := a.core.newClientWithTrace()
 	if err != nil {
@@ -1912,15 +1919,15 @@ func (a *automationServer) ListFirewallRules(ctx context.Context, req *pluginv1.
 	if err != nil {
 		return nil, err
 	}
-	publicIP := resolvePublicIP(ctx, c, hsName)
 	var rules []FirewallRule
+	var state *FirewallState
 	err = a.core.retry(func() error {
 		var callErr error
-		rules, callErr = c.ListFirewallRules(ctx, hsName, vmUUID, publicIP)
+		rules, state, callErr = c.ListFirewallRules(ctx, hsName, vmUUID)
 		return callErr
 	})
 	if err != nil {
-		return nil, wrapHTTPTraceErr(err, last)
+		return nil, resourceErr(err, last)
 	}
 	out := make([]*pluginv1.AutomationFirewallRule, 0, len(rules))
 	for _, r := range rules {
@@ -1932,9 +1939,25 @@ func (a *automationServer) ListFirewallRules(ctx context.Context, req *pluginv1.
 			Port:      r.Port,
 			Ip:        r.IP,
 			Priority:  int32(r.Priority),
+			Enable:    r.Enable,
+			Dest:      r.Dest,
+			Sport:     r.Sport,
+			Comment:   r.Comment,
+			Macro:     r.Macro,
+			Iface:     r.Iface,
 		})
 	}
-	return &pluginv1.ListFirewallRulesResponse{Items: out}, nil
+	resp := &pluginv1.ListFirewallRulesResponse{Items: out}
+	if state != nil {
+		resp.State = &pluginv1.AutomationFirewallState{
+			Enabled:   state.Enabled,
+			PolicyIn:  state.PolicyIn,
+			PolicyOut: state.PolicyOut,
+			Effective: state.Effective,
+			Platform:  state.Platform,
+		}
+	}
+	return resp, nil
 }
 
 // AddFirewallRule 添加防火墙规则
@@ -1950,18 +1973,72 @@ func (a *automationServer) AddFirewallRule(ctx context.Context, req *pluginv1.Ad
 	if err != nil {
 		return nil, err
 	}
-	rule := FirewallRule{
-		Direction: req.GetDirection(),
-		Protocol:  req.GetProtocol(),
-		Method:    req.GetMethod(),
-		Port:      req.GetPort(),
-		IP:        req.GetIp(),
-		Priority:  int(req.GetPriority()),
-	}
+	rule := firewallRuleFromProto(
+		req.GetDirection(), req.GetProtocol(), req.GetMethod(), req.GetPort(), req.GetIp(),
+		req.GetEnable(), req.GetDest(), req.GetSport(), req.GetComment(), req.GetMacro(), req.GetIface(),
+	)
 	if err := c.AddFirewallRule(ctx, hsName, vmUUID, rule); err != nil {
-		return nil, wrapHTTPTraceErr(err, last)
+		return nil, resourceErr(err, last)
 	}
 	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// UpdateFirewallRule 按平台位序更新防火墙规则
+func (a *automationServer) UpdateFirewallRule(ctx context.Context, req *pluginv1.UpdateFirewallRuleRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	rule := firewallRuleFromProto(
+		req.GetDirection(), req.GetProtocol(), req.GetMethod(), req.GetPort(), req.GetIp(),
+		req.GetEnable(), req.GetDest(), req.GetSport(), req.GetComment(), req.GetMacro(), req.GetIface(),
+	)
+	if err := c.UpdateFirewallRule(ctx, hsName, vmUUID, int(req.GetRuleId()), rule); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// firewallRuleFromProto 组装防火墙规则，补齐缺省值：
+// 方向缺省 in、动作缺省 ACCEPT、协议缺省空（任意），与平台默认语义一致。
+func firewallRuleFromProto(direction, protocol, method, port, ip string, enable bool,
+	dest, sport, comment, macro, iface string) FirewallRule {
+	direction = strings.ToLower(strings.TrimSpace(direction))
+	if direction == "" || direction == "in" || direction == "inbound" {
+		direction = "in"
+	} else {
+		direction = "out"
+	}
+	method = strings.ToUpper(strings.TrimSpace(method))
+	switch method {
+	case "ACCEPT", "DROP", "REJECT":
+	default:
+		method = "ACCEPT"
+	}
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if protocol == "all" {
+		protocol = ""
+	}
+	return FirewallRule{
+		Direction: direction,
+		Protocol:  protocol,
+		Method:    method,
+		Port:      strings.TrimSpace(port),
+		IP:        strings.TrimSpace(ip),
+		Enable:    enable,
+		Dest:      strings.TrimSpace(dest),
+		Sport:     strings.TrimSpace(sport),
+		Comment:   strings.TrimSpace(comment),
+		Macro:     strings.TrimSpace(macro),
+		Iface:     strings.TrimSpace(iface),
+	}
 }
 
 // DeleteFirewallRule 删除防火墙规则
@@ -1978,9 +2055,661 @@ func (a *automationServer) DeleteFirewallRule(ctx context.Context, req *pluginv1
 		return nil, err
 	}
 	if err := c.DeleteFirewallRule(ctx, hsName, vmUUID, int(req.GetRuleId())); err != nil {
-		return nil, wrapHTTPTraceErr(err, last)
+		return nil, resourceErr(err, last)
 	}
 	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// SetFirewallOptions 保存防火墙开关与默认策略
+func (a *automationServer) SetFirewallOptions(ctx context.Context, req *pluginv1.SetFirewallOptionsRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	if err := c.SetFirewallOptions(ctx, hsName, vmUUID, req.GetEnable(), req.GetPolicyIn(), req.GetPolicyOut()); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// ---- 网卡管理 ----
+
+// ListNetworkCards 获取网卡列表
+func (a *automationServer) ListNetworkCards(ctx context.Context, req *pluginv1.ListNetworkCardsRequest) (*pluginv1.ListNetworkCardsResponse, error) {
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	var cards []NetworkCard
+	err = a.core.retry(func() error {
+		var callErr error
+		cards, callErr = c.ListNetworkCards(ctx, hsName, vmUUID)
+		return callErr
+	})
+	if err != nil {
+		return nil, resourceErr(err, last)
+	}
+	out := make([]*pluginv1.AutomationNetworkCard, 0, len(cards))
+	for _, card := range cards {
+		out = append(out, &pluginv1.AutomationNetworkCard{
+			NicName:   card.NicName,
+			NicType:   card.NicType,
+			MacAddr:   card.MacAddr,
+			Ip4Addr:   card.IP4Addr,
+			Ip6Addr:   card.IP6Addr,
+			NicGate:   card.NicGate,
+			NicMask:   card.NicMask,
+			DnsAddr:   card.DNSAddr,
+			Ip6Prefix: int32(card.IP6Prefix),
+		})
+	}
+	return &pluginv1.ListNetworkCardsResponse{Items: out}, nil
+}
+
+// networkCardFromProto 把 proto 网卡转换为客户端模型
+func networkCardFromProto(card *pluginv1.AutomationNetworkCard) NetworkCard {
+	if card == nil {
+		return NetworkCard{}
+	}
+	return NetworkCard{
+		NicName:   strings.TrimSpace(card.GetNicName()),
+		NicType:   strings.TrimSpace(card.GetNicType()),
+		MacAddr:   strings.TrimSpace(card.GetMacAddr()),
+		IP4Addr:   strings.TrimSpace(card.GetIp4Addr()),
+		IP6Addr:   strings.TrimSpace(card.GetIp6Addr()),
+		NicGate:   strings.TrimSpace(card.GetNicGate()),
+		NicMask:   strings.TrimSpace(card.GetNicMask()),
+		DNSAddr:   card.GetDnsAddr(),
+		IP6Prefix: int(card.GetIp6Prefix()),
+	}
+}
+
+// CreateNetworkCard 新增网卡
+func (a *automationServer) CreateNetworkCard(ctx context.Context, req *pluginv1.CreateNetworkCardRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	if err := c.CreateNetworkCard(ctx, hsName, vmUUID, networkCardFromProto(req.GetCard())); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// UpdateNetworkCard 更新网卡
+func (a *automationServer) UpdateNetworkCard(ctx context.Context, req *pluginv1.UpdateNetworkCardRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	nicName := strings.TrimSpace(req.GetNicName())
+	if nicName == "" {
+		return nil, fmt.Errorf("缺少网卡名称")
+	}
+	if err := c.UpdateNetworkCard(ctx, hsName, vmUUID, nicName, networkCardFromProto(req.GetCard())); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// DeleteNetworkCard 删除网卡
+func (a *automationServer) DeleteNetworkCard(ctx context.Context, req *pluginv1.DeleteNetworkCardRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	nicName := strings.TrimSpace(req.GetNicName())
+	if nicName == "" {
+		return nil, fmt.Errorf("缺少网卡名称")
+	}
+	if err := c.DeleteNetworkCard(ctx, hsName, vmUUID, nicName); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// ---- 数据盘管理 ----
+
+// ListDataDisks 获取数据盘列表
+func (a *automationServer) ListDataDisks(ctx context.Context, req *pluginv1.ListDataDisksRequest) (*pluginv1.ListDataDisksResponse, error) {
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	var disks []DataDisk
+	err = a.core.retry(func() error {
+		var callErr error
+		disks, callErr = c.ListDataDisks(ctx, hsName, vmUUID)
+		return callErr
+	})
+	if err != nil {
+		return nil, resourceErr(err, last)
+	}
+	out := make([]*pluginv1.AutomationDataDisk, 0, len(disks))
+	for _, d := range disks {
+		out = append(out, &pluginv1.AutomationDataDisk{
+			HddName: d.HddName,
+			HddSize: int32(d.HddSize),
+			HddFlag: int32(d.HddFlag),
+			HddType: int32(d.HddType),
+			HddPath: d.HddPath,
+			HddScsi: d.HddScsi,
+		})
+	}
+	return &pluginv1.ListDataDisksResponse{Items: out}, nil
+}
+
+// AttachDataDisk 挂载数据盘（sizeGB 为前端展示单位，主控接口使用 MB）
+func (a *automationServer) AttachDataDisk(ctx context.Context, req *pluginv1.AttachDataDiskRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	if req.GetHddSize() <= 0 {
+		return nil, fmt.Errorf("磁盘大小必须大于 0")
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	if err := c.AttachDataDisk(ctx, hsName, vmUUID, int(req.GetHddSize()), int(req.GetHddType())); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// DetachDataDisk 卸载数据盘
+func (a *automationServer) DetachDataDisk(ctx context.Context, req *pluginv1.DetachDataDiskRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	hddName := strings.TrimSpace(req.GetHddName())
+	if hddName == "" {
+		return nil, fmt.Errorf("缺少磁盘名称")
+	}
+	if err := c.DetachDataDisk(ctx, hsName, vmUUID, hddName); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// DeleteDataDisk 删除数据盘
+func (a *automationServer) DeleteDataDisk(ctx context.Context, req *pluginv1.DeleteDataDiskRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	hddName := strings.TrimSpace(req.GetHddName())
+	if hddName == "" {
+		return nil, fmt.Errorf("缺少磁盘名称")
+	}
+	if err := c.DeleteDataDisk(ctx, hsName, vmUUID, hddName); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// ---- 光盘管理 ----
+
+// ListISOs 获取已挂载光盘列表
+func (a *automationServer) ListISOs(ctx context.Context, req *pluginv1.ListISOsRequest) (*pluginv1.ListISOsResponse, error) {
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	var isos []ISOInfo
+	err = a.core.retry(func() error {
+		var callErr error
+		isos, callErr = c.ListISOs(ctx, hsName, vmUUID)
+		return callErr
+	})
+	if err != nil {
+		return nil, resourceErr(err, last)
+	}
+	out := make([]*pluginv1.AutomationISO, 0, len(isos))
+	for _, iso := range isos {
+		out = append(out, &pluginv1.AutomationISO{
+			IsoName: iso.IsoName,
+			IsoFile: iso.IsoFile,
+			IsoPath: iso.IsoPath,
+			IsoHint: iso.IsoHint,
+		})
+	}
+	// 可用镜像列表失败不影响已挂载光盘的展示，仅降级为空下拉。
+	available, availErr := c.ListHostISOImages(ctx, hsName)
+	if availErr != nil {
+		pluginLog.Printf("[ListISOs] 读取主机 ISO 列表失败 hs=%s: %v", hsName, availErr)
+		available = nil
+	}
+	return &pluginv1.ListISOsResponse{Items: out, AvailableIsos: available}, nil
+}
+
+// MountISO 挂载光盘
+func (a *automationServer) MountISO(ctx context.Context, req *pluginv1.MountISORequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	isoFile := strings.TrimSpace(req.GetIsoFile())
+	isoPath := strings.TrimSpace(req.GetIsoPath())
+	if isoFile == "" && isoPath == "" {
+		return nil, fmt.Errorf("缺少镜像文件")
+	}
+	if err := c.MountISOImage(ctx, hsName, vmUUID, isoFile, isoPath, req.GetIsoHint()); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// UnmountISO 卸载光盘
+func (a *automationServer) UnmountISO(ctx context.Context, req *pluginv1.UnmountISORequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	isoName := strings.TrimSpace(req.GetIsoName())
+	if isoName == "" {
+		return nil, fmt.Errorf("缺少光盘名称")
+	}
+	if err := c.UnmountISO(ctx, hsName, vmUUID, isoName); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// ---- 反向代理 ----
+
+// ListReverseProxies 获取反向代理列表
+func (a *automationServer) ListReverseProxies(ctx context.Context, req *pluginv1.ListReverseProxiesRequest) (*pluginv1.ListReverseProxiesResponse, error) {
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	var list []ReverseProxy
+	err = a.core.retry(func() error {
+		var callErr error
+		list, callErr = c.ListReverseProxies(ctx, hsName, vmUUID)
+		return callErr
+	})
+	if err != nil {
+		return nil, resourceErr(err, last)
+	}
+	out := make([]*pluginv1.AutomationReverseProxy, 0, len(list))
+	for i, p := range list {
+		// 主控的 update / delete 以列表下标定位代理，这里必须使用遍历下标而非平台字段，
+		// 否则列表中存在缺省 proxy_index 时会出现重复 ID 导致误删。
+		out = append(out, &pluginv1.AutomationReverseProxy{
+			Id:          int64(i),
+			Domain:      p.Domain,
+			BackendIp:   p.BackendIP,
+			BackendPort: int32(p.BackendPort),
+			SslEnabled:  p.SSLEnabled,
+			Description: p.Description,
+		})
+	}
+	return &pluginv1.ListReverseProxiesResponse{Items: out}, nil
+}
+
+// reverseProxyFromProto 组装反向代理配置
+func reverseProxyFromProto(domain, backendIP string, backendPort int32, ssl bool, description string) ReverseProxy {
+	port := int(backendPort)
+	if port <= 0 {
+		port = 80
+	}
+	return ReverseProxy{
+		Domain:      strings.TrimSpace(domain),
+		BackendIP:   strings.TrimSpace(backendIP),
+		BackendPort: port,
+		SSLEnabled:  ssl,
+		Description: strings.TrimSpace(description),
+	}
+}
+
+// CreateReverseProxy 新增反向代理
+func (a *automationServer) CreateReverseProxy(ctx context.Context, req *pluginv1.CreateReverseProxyRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	if strings.TrimSpace(req.GetDomain()) == "" {
+		return nil, fmt.Errorf("域名不能为空")
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	proxy := reverseProxyFromProto(req.GetDomain(), req.GetBackendIp(), req.GetBackendPort(), req.GetSslEnabled(), req.GetDescription())
+	if err := c.CreateReverseProxy(ctx, hsName, vmUUID, proxy); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// UpdateReverseProxy 更新反向代理
+func (a *automationServer) UpdateReverseProxy(ctx context.Context, req *pluginv1.UpdateReverseProxyRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	proxy := reverseProxyFromProto(req.GetDomain(), req.GetBackendIp(), req.GetBackendPort(), req.GetSslEnabled(), req.GetDescription())
+	if err := c.UpdateReverseProxy(ctx, hsName, vmUUID, int(req.GetProxyIndex()), proxy); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// DeleteReverseProxy 删除反向代理
+func (a *automationServer) DeleteReverseProxy(ctx context.Context, req *pluginv1.DeleteReverseProxyRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	if err := c.DeleteReverseProxy(ctx, hsName, vmUUID, int(req.GetProxyIndex())); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// ---- 启动顺序 ----
+
+// GetBootOrder 获取启动顺序
+func (a *automationServer) GetBootOrder(ctx context.Context, req *pluginv1.GetBootOrderRequest) (*pluginv1.GetBootOrderResponse, error) {
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	var items []BootOption
+	err = a.core.retry(func() error {
+		var callErr error
+		items, callErr = c.GetBootOrder(ctx, hsName, vmUUID)
+		return callErr
+	})
+	if err != nil {
+		return nil, resourceErr(err, last)
+	}
+	out := make([]*pluginv1.AutomationBootOption, 0, len(items))
+	for _, it := range items {
+		out = append(out, &pluginv1.AutomationBootOption{EfiType: it.EfiType, EfiName: it.EfiName})
+	}
+	return &pluginv1.GetBootOrderResponse{Items: out}, nil
+}
+
+// SetBootOrder 保存启动顺序
+func (a *automationServer) SetBootOrder(ctx context.Context, req *pluginv1.SetBootOrderRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	items := make([]BootOption, 0, len(req.GetItems()))
+	for _, it := range req.GetItems() {
+		name := strings.TrimSpace(it.GetEfiName())
+		if name == "" {
+			continue
+		}
+		items = append(items, BootOption{EfiType: it.GetEfiType(), EfiName: name})
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("启动项不能为空")
+	}
+	if err := c.SetBootOrder(ctx, hsName, vmUUID, items); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// ---- PCI / USB 直通 ----
+
+// ListPCIDevices 获取主机可直通 PCI 设备列表
+func (a *automationServer) ListPCIDevices(ctx context.Context, req *pluginv1.ListPCIDevicesRequest) (*pluginv1.ListPCIDevicesResponse, error) {
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, _, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	var items []PCIDevice
+	err = a.core.retry(func() error {
+		var callErr error
+		items, callErr = c.ListPCIDevices(ctx, hsName)
+		return callErr
+	})
+	if err != nil {
+		return nil, resourceErr(err, last)
+	}
+	out := make([]*pluginv1.AutomationPCIDevice, 0, len(items))
+	for _, d := range items {
+		out = append(out, &pluginv1.AutomationPCIDevice{
+			PciKey:  d.PciKey,
+			GpuUuid: d.GpuUUID,
+			GpuMdev: d.GpuMdev,
+			GpuHint: d.GpuHint,
+		})
+	}
+	return &pluginv1.ListPCIDevicesResponse{Items: out}, nil
+}
+
+// SetupPCIDevice 添加 / 移除 PCI 直通
+func (a *automationServer) SetupPCIDevice(ctx context.Context, req *pluginv1.SetupPCIDeviceRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	device := PCIDevice{}
+	if d := req.GetDevice(); d != nil {
+		device = PCIDevice{
+			PciKey:  strings.TrimSpace(d.GetPciKey()),
+			GpuUUID: strings.TrimSpace(d.GetGpuUuid()),
+			GpuMdev: strings.TrimSpace(d.GetGpuMdev()),
+			GpuHint: strings.TrimSpace(d.GetGpuHint()),
+		}
+	}
+	if device.PciKey == "" {
+		return nil, fmt.Errorf("缺少 PCI 设备标识")
+	}
+	add := strings.EqualFold(strings.TrimSpace(req.GetAction()), "add")
+	if err := c.SetupPCI(ctx, hsName, vmUUID, device, add); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// ListUSBDevices 获取主机可直通 USB 设备列表
+func (a *automationServer) ListUSBDevices(ctx context.Context, req *pluginv1.ListUSBDevicesRequest) (*pluginv1.ListUSBDevicesResponse, error) {
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, _, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	var items []USBDevice
+	err = a.core.retry(func() error {
+		var callErr error
+		items, callErr = c.ListUSBDevices(ctx, hsName)
+		return callErr
+	})
+	if err != nil {
+		return nil, resourceErr(err, last)
+	}
+	out := make([]*pluginv1.AutomationUSBDevice, 0, len(items))
+	for _, d := range items {
+		out = append(out, &pluginv1.AutomationUSBDevice{
+			UsbKey:  d.UsbKey,
+			VidUuid: d.VidUUID,
+			PidUuid: d.PidUUID,
+			UsbHint: d.UsbHint,
+		})
+	}
+	return &pluginv1.ListUSBDevicesResponse{Items: out}, nil
+}
+
+// SetupUSBDevice 添加 / 移除 USB 直通
+func (a *automationServer) SetupUSBDevice(ctx context.Context, req *pluginv1.SetupUSBDeviceRequest) (*pluginv1.OperationResult, error) {
+	if a.core.cfg.DryRun {
+		return &pluginv1.OperationResult{Ok: true}, nil
+	}
+	c, last, err := a.core.newClientWithTrace()
+	if err != nil {
+		return nil, err
+	}
+	hsName, vmUUID, err := a.core.resolveInstanceWithFallback(ctx, req.GetInstanceId())
+	if err != nil {
+		return nil, err
+	}
+	device := USBDevice{}
+	if d := req.GetDevice(); d != nil {
+		device = USBDevice{
+			UsbKey:  strings.TrimSpace(d.GetUsbKey()),
+			VidUUID: strings.TrimSpace(d.GetVidUuid()),
+			PidUUID: strings.TrimSpace(d.GetPidUuid()),
+			UsbHint: strings.TrimSpace(d.GetUsbHint()),
+		}
+	}
+	if device.UsbKey == "" {
+		return nil, fmt.Errorf("缺少 USB 设备标识")
+	}
+	add := strings.EqualFold(strings.TrimSpace(req.GetAction()), "add")
+	if err := c.SetupUSB(ctx, hsName, vmUUID, device, add); err != nil {
+		return nil, resourceErr(err, last)
+	}
+	return &pluginv1.OperationResult{Ok: true}, nil
+}
+
+// resourceErr 统一资源类操作的错误包装：
+// 平台不支持时返回 gRPC Unimplemented（宿主侧映射为 ErrNotSupported → HTTP 501），
+// 其余错误附带最近一次 HTTP 调用轨迹便于排障。
+func resourceErr(err error, last *HTTPLogEntry) error {
+	if err == nil {
+		return nil
+	}
+	if isUnsupportedPlatformError(err) {
+		return status.Error(codes.Unimplemented, err.Error())
+	}
+	return wrapHTTPTraceErr(err, last)
+}
+
+// isUnsupportedPlatformError 判断上游是否明确表示「当前虚拟化平台不支持该能力」。
+func isUnsupportedPlatformError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "不支持") || strings.Contains(strings.ToLower(msg), "not supported") ||
+		strings.Contains(strings.ToLower(msg), "unsupported")
 }
 
 // parseTimeToUnix 解析时间字符串为 Unix 时间戳

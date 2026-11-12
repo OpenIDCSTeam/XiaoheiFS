@@ -456,6 +456,7 @@
               <a-switch
                 :checked="!!firewallState.enabled"
                 :loading="firewallOptionsBusy"
+                :disabled="featureReadonly('firewall')"
                 checked-children="开启"
                 un-checked-children="关闭"
                 @change="(v) => saveFirewallOptions({ enable: !!v })"
@@ -470,7 +471,7 @@
                   :value="firewallState.policy_in || 'ACCEPT'"
                   size="small"
                   style="width: 96px"
-                  :disabled="firewallOptionsBusy"
+                  :disabled="firewallOptionsBusy || featureReadonly('firewall')"
                   @change="(v) => saveFirewallOptions({ policy_in: String(v) })"
                 >
                   <a-select-option value="ACCEPT">放行</a-select-option>
@@ -482,7 +483,7 @@
                   :value="firewallState.policy_out || 'ACCEPT'"
                   size="small"
                   style="width: 96px"
-                  :disabled="firewallOptionsBusy"
+                  :disabled="firewallOptionsBusy || featureReadonly('firewall')"
                   @change="(v) => saveFirewallOptions({ policy_out: String(v) })"
                 >
                   <a-select-option value="ACCEPT">放行</a-select-option>
@@ -491,7 +492,8 @@
                 </a-select>
               </template>
               <a-divider type="vertical" />
-              <a-button type="primary" size="small" @click="openFirewallModal()">
+              <a-tag v-if="featureReadonly('firewall')" color="orange">只读</a-tag>
+              <a-button v-else type="primary" size="small" @click="openFirewallModal()">
                 <PlusOutlined />
                 添加规则
               </a-button>
@@ -522,8 +524,11 @@
                 <a-tag :color="firewallActionColor(record.method)">{{ firewallActionLabel(record.method) }}</a-tag>
               </template>
               <template v-else-if="column.key === 'action'">
-                <a-button type="link" size="small" @click="openFirewallModal(record)">编辑</a-button>
-                <a-button type="link" size="small" danger @click="removeFirewallRule(record)">删除</a-button>
+                <span v-if="featureReadonly('firewall')" class="subtle">只读</span>
+                <template v-else>
+                  <a-button type="link" size="small" @click="openFirewallModal(record)">编辑</a-button>
+                  <a-button type="link" size="small" danger @click="removeFirewallRule(record)">删除</a-button>
+                </template>
               </template>
             </template>
           </a-table>
@@ -542,7 +547,8 @@
             </div>
           </template>
           <div class="tab-actions">
-            <a-button type="primary" size="small" @click="openPortModal">
+            <a-tag v-if="featureReadonly('port_mapping')" color="orange">只读</a-tag>
+            <a-button v-else type="primary" size="small" @click="openPortModal">
               <PlusOutlined />
               添加映射
             </a-button>
@@ -562,6 +568,7 @@
               </template>
               <template v-if="column.key === 'action'">
                 <a-tag v-if="Number(record?.sys) === 2" color="blue">系统</a-tag>
+                <span v-else-if="featureReadonly('port_mapping')" class="subtle">只读</span>
                 <a-button
                   v-else
                   type="link"
@@ -591,7 +598,8 @@
           </template>
           <div class="tab-actions">
             <a-space>
-              <a-button type="primary" size="small" @click="openSnapshotModal">
+              <a-tag v-if="featureReadonly('snapshot')" color="orange">只读模式：仅可查看</a-tag>
+              <a-button v-else type="primary" size="small" @click="openSnapshotModal">
                 <PlusOutlined />
                 创建快照
               </a-button>
@@ -613,8 +621,11 @@
                 <a-tag v-if="record.current" color="blue" style="margin-left: 6px">当前</a-tag>
               </template>
               <template v-if="column.key === 'action'">
-                <a-button type="link" size="small" @click="restoreSnapshot(record)">恢复</a-button>
-                <a-button type="link" size="small" danger @click="deleteSnapshot(record)">删除</a-button>
+                <span v-if="featureReadonly('snapshot')" class="subtle">只读</span>
+                <template v-else>
+                  <a-button type="link" size="small" @click="restoreSnapshot(record)">恢复</a-button>
+                  <a-button type="link" size="small" danger @click="deleteSnapshot(record)">删除</a-button>
+                </template>
               </template>
             </template>
           </a-table>
@@ -633,7 +644,8 @@
             </div>
           </template>
           <div class="tab-actions">
-            <a-button type="primary" size="small" @click="createBackup">
+            <a-tag v-if="featureReadonly('backup')" color="orange">只读模式：仅可查看</a-tag>
+            <a-button v-else type="primary" size="small" @click="createBackup">
               <PlusOutlined />
               创建备份
             </a-button>
@@ -652,8 +664,11 @@
                 <a-badge :status="record.state_badge || 'default'" :text="record.state_label || '未知'" />
               </template>
               <template v-if="column.key === 'action'">
-                <a-button type="link" size="small" @click="restoreBackup(record)">恢复</a-button>
-                <a-button type="link" size="small" danger @click="deleteBackup(record)">删除</a-button>
+                <span v-if="featureReadonly('backup')" class="subtle">只读</span>
+                <template v-else>
+                  <a-button type="link" size="small" @click="restoreBackup(record)">恢复</a-button>
+                  <a-button type="link" size="small" danger @click="deleteBackup(record)">删除</a-button>
+                </template>
               </template>
             </template>
           </a-table>
@@ -672,7 +687,8 @@
           </template>
           <div class="tab-actions">
             <a-space>
-              <a-button type="primary" size="small" @click="openNicModal()">
+              <a-tag v-if="featureReadonly('nic')" color="orange">只读模式：仅可查看</a-tag>
+              <a-button v-else type="primary" size="small" @click="openNicModal()">
                 <PlusOutlined />
                 添加网卡
               </a-button>
@@ -690,8 +706,11 @@
           >
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'action'">
-                <a-button type="link" size="small" @click="openNicModal(record)">编辑</a-button>
-                <a-button type="link" size="small" danger @click="removeNetworkCard(record)">删除</a-button>
+                <span v-if="featureReadonly('nic')" class="subtle">只读</span>
+                <template v-else>
+                  <a-button type="link" size="small" @click="openNicModal(record)">编辑</a-button>
+                  <a-button type="link" size="small" danger @click="removeNetworkCard(record)">删除</a-button>
+                </template>
               </template>
             </template>
           </a-table>
@@ -711,7 +730,8 @@
           </template>
           <div class="tab-actions">
             <a-space>
-              <a-button type="primary" size="small" @click="diskOpen = true">
+              <a-tag v-if="featureReadonly('disk')" color="orange">只读模式：仅可查看</a-tag>
+              <a-button v-else type="primary" size="small" @click="diskOpen = true">
                 <PlusOutlined />
                 挂载数据盘
               </a-button>
@@ -737,13 +757,16 @@
                 {{ Number(record.hdd_type) === 1 ? 'SSD' : 'HDD' }}
               </template>
               <template v-else-if="column.key === 'action'">
-                <a-button
-                  v-if="Number(record.hdd_flag) === 1"
-                  type="link"
-                  size="small"
-                  @click="unmountDisk(record)"
-                >卸载</a-button>
-                <a-button type="link" size="small" danger @click="removeDisk(record)">删除</a-button>
+                <span v-if="featureReadonly('disk')" class="subtle">只读</span>
+                <template v-else>
+                  <a-button
+                    v-if="Number(record.hdd_flag) === 1"
+                    type="link"
+                    size="small"
+                    @click="unmountDisk(record)"
+                  >卸载</a-button>
+                  <a-button type="link" size="small" danger @click="removeDisk(record)">删除</a-button>
+                </template>
               </template>
             </template>
           </a-table>
@@ -763,7 +786,8 @@
           </template>
           <div class="tab-actions">
             <a-space>
-              <a-button type="primary" size="small" @click="openIsoModal">
+              <a-tag v-if="featureReadonly('iso')" color="orange">只读模式：仅可查看</a-tag>
+              <a-button v-else type="primary" size="small" @click="openIsoModal">
                 <PlusOutlined />
                 挂载光盘
               </a-button>
@@ -781,7 +805,8 @@
           >
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'action'">
-                <a-button type="link" size="small" danger @click="unmountISO(record)">卸载</a-button>
+                <span v-if="featureReadonly('iso')" class="subtle">只读</span>
+                <a-button v-else type="link" size="small" danger @click="unmountISO(record)">卸载</a-button>
               </template>
             </template>
           </a-table>
@@ -801,7 +826,8 @@
           </template>
           <div class="tab-actions">
             <a-space>
-              <a-button type="primary" size="small" @click="openProxyModal()">
+              <a-tag v-if="featureReadonly('reverse_proxy')" color="orange">只读模式：仅可查看</a-tag>
+              <a-button v-else type="primary" size="small" @click="openProxyModal()">
                 <PlusOutlined />
                 添加代理
               </a-button>
@@ -822,8 +848,11 @@
                 <a-tag :color="record.ssl_enabled ? 'green' : 'default'">{{ record.ssl_enabled ? 'HTTPS' : 'HTTP' }}</a-tag>
               </template>
               <template v-else-if="column.key === 'action'">
-                <a-button type="link" size="small" @click="openProxyModal(record)">编辑</a-button>
-                <a-button type="link" size="small" danger @click="removeReverseProxy(record)">删除</a-button>
+                <span v-if="featureReadonly('reverse_proxy')" class="subtle">只读</span>
+                <template v-else>
+                  <a-button type="link" size="small" @click="openProxyModal(record)">编辑</a-button>
+                  <a-button type="link" size="small" danger @click="removeReverseProxy(record)">删除</a-button>
+                </template>
               </template>
             </template>
           </a-table>
@@ -843,7 +872,8 @@
           </template>
           <div class="tab-actions">
             <a-space>
-              <a-button type="primary" size="small" :loading="bootOrderSaving" @click="saveBootOrder">保存顺序</a-button>
+              <a-tag v-if="featureReadonly('boot_order')" color="orange">只读模式：仅可查看</a-tag>
+              <a-button v-else type="primary" size="small" :loading="bootOrderSaving" @click="saveBootOrder">保存顺序</a-button>
               <a-button size="small" @click="fetchBootOrder">刷新</a-button>
             </a-space>
           </div>
@@ -862,13 +892,16 @@
                   <span>{{ item.efi_name }}</span>
                 </a-space>
                 <template #actions>
-                  <a-button type="link" size="small" :disabled="index === 0" @click="moveBootOption(index, -1)">上移</a-button>
-                  <a-button
-                    type="link"
-                    size="small"
-                    :disabled="index === bootOrder.length - 1"
-                    @click="moveBootOption(index, 1)"
-                  >下移</a-button>
+                  <span v-if="featureReadonly('boot_order')" class="subtle">只读</span>
+                  <template v-else>
+                    <a-button type="link" size="small" :disabled="index === 0" @click="moveBootOption(index, -1)">上移</a-button>
+                    <a-button
+                      type="link"
+                      size="small"
+                      :disabled="index === bootOrder.length - 1"
+                      @click="moveBootOption(index, 1)"
+                    >下移</a-button>
+                  </template>
                 </template>
               </a-list-item>
             </template>
@@ -907,8 +940,11 @@
           >
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'action'">
-                <a-button type="link" size="small" @click="setupPCIDevice(record, true)">直通到实例</a-button>
-                <a-button type="link" size="small" danger @click="setupPCIDevice(record, false)">移除直通</a-button>
+                <span v-if="featureReadonly('pci')" class="subtle">只读</span>
+                <template v-else>
+                  <a-button type="link" size="small" @click="setupPCIDevice(record, true)">直通到实例</a-button>
+                  <a-button type="link" size="small" danger @click="setupPCIDevice(record, false)">移除直通</a-button>
+                </template>
               </template>
             </template>
           </a-table>
@@ -946,8 +982,11 @@
           >
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'action'">
-                <a-button type="link" size="small" @click="setupUSBDevice(record, true)">直通到实例</a-button>
-                <a-button type="link" size="small" danger @click="setupUSBDevice(record, false)">移除直通</a-button>
+                <span v-if="featureReadonly('usb')" class="subtle">只读</span>
+                <template v-else>
+                  <a-button type="link" size="small" @click="setupUSBDevice(record, true)">直通到实例</a-button>
+                  <a-button type="link" size="small" danger @click="setupUSBDevice(record, false)">移除直通</a-button>
+                </template>
               </template>
             </template>
           </a-table>
@@ -1805,6 +1844,23 @@ const unsupportedFeatureHints = computed(() => {
       reason: String(reasons[item.key] || "当前实例不支持该能力")
     }));
 });
+
+// 只读功能集合：功能本身可见（tab 渲染、列表可查），但不允许创建/修改/删除。
+// 来源是后端下发的 capabilities.automation.readonly_features。
+const readonlyFeatureSet = computed(() => {
+  const list = detail.value?.capabilities?.automation?.readonly_features;
+  if (!Array.isArray(list)) return new Set();
+  return new Set(list.map((item) => String(item).toLowerCase()));
+});
+
+const featureReadonly = (key) => readonlyFeatureSet.value.has(String(key).toLowerCase());
+
+// 写操作统一入口：只读时提示并中止，避免用户点开表单才发现不能提交。
+const ensureFeatureWritable = (key, label) => {
+  if (!featureReadonly(key)) return true;
+  message.warning(`${label}当前为只读模式，无法修改`);
+  return false;
+};
 
 const availableTabs = computed(() => {
   const tabs = ["overview", "monitor"];
@@ -2808,6 +2864,7 @@ watch(activeTab, (val) => {
 });
 
 const openFirewallModal = (record) => {
+  if (!ensureFeatureWritable("firewall", "防火墙")) return;
   firewallEditingId.value = record ? (record.id ?? record.ID ?? null) : null;
   firewallForm.direction = record?.direction || "in";
   firewallForm.protocol = record?.protocol ?? "tcp";
@@ -2942,6 +2999,7 @@ const removePortMapping = (record) => {
 };
 
 const openSnapshotModal = () => {
+  if (!ensureFeatureWritable("snapshot", "快照")) return;
   snapshotForm.name = "";
   snapshotForm.description = "";
   snapshotOpen.value = true;
@@ -3002,6 +3060,7 @@ const restoreSnapshot = (record) => {
 };
 
 const createBackup = async () => {
+  if (!ensureFeatureWritable("backup", "备份")) return;
   try {
     await createVpsBackup(id);
     await fetchBackups();
@@ -3049,6 +3108,7 @@ const restoreBackup = (record) => {
 // ---- 网卡 ----
 
 const openNicModal = (record) => {
+  if (!ensureFeatureWritable("nic", "网卡管理")) return;
   nicEditing.value = record ? String(record.nic_name || "") : "";
   nicForm.nic_name = record ? String(record.nic_name || "") : "";
   nicForm.nic_type = record?.nic_type || "nat";
@@ -3111,6 +3171,7 @@ const removeNetworkCard = (record) => {
 // ---- 数据盘 ----
 
 const submitDisk = async () => {
+  if (!ensureFeatureWritable("disk", "数据盘")) return;
   const size = Number(diskForm.size_gb || 0);
   if (size <= 0) {
     message.error("请输入磁盘容量");
@@ -3168,6 +3229,7 @@ const removeDisk = (record) => {
 // ---- 光盘 ----
 
 const openIsoModal = () => {
+  if (!ensureFeatureWritable("iso", "光盘管理")) return;
   isoForm.iso_file = "";
   isoForm.iso_hint = "";
   if (!isoAvailable.value.length) fetchISOs();
@@ -3214,6 +3276,7 @@ const unmountISO = (record) => {
 // ---- 反向代理 ----
 
 const openProxyModal = (record) => {
+  if (!ensureFeatureWritable("reverse_proxy", "反向代理")) return;
   proxyEditingId.value = record ? (record.id ?? record.ID ?? null) : null;
   proxyForm.domain = record?.domain || "";
   proxyForm.backend_ip = record?.backend_ip || "";
@@ -3284,6 +3347,7 @@ const moveBootOption = (index, offset) => {
 };
 
 const saveBootOrder = async () => {
+  if (!ensureFeatureWritable("boot_order", "启动顺序")) return;
   if (!bootOrder.value.length) {
     message.error("没有可保存的启动项");
     return;
@@ -3306,6 +3370,7 @@ const saveBootOrder = async () => {
 // ---- PCI / USB 直通 ----
 
 const setupPCIDevice = async (record, add) => {
+  if (!ensureFeatureWritable("pci", "PCI 直通")) return;
   passthroughLoading.value = true;
   try {
     await setupVpsPCIDevice(id, {
@@ -3324,6 +3389,7 @@ const setupPCIDevice = async (record, add) => {
 };
 
 const setupUSBDevice = async (record, add) => {
+  if (!ensureFeatureWritable("usb", "USB 直通")) return;
   passthroughLoading.value = true;
   try {
     await setupVpsUSBDevice(id, {

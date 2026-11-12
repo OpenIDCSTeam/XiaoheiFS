@@ -376,15 +376,24 @@
         <a-divider />
         <div class="section-title">插件功能开关</div>
         <div class="subtle" style="margin-bottom: 8px">
-          「跟随插件」由插件声明的能力决定；选择「关闭」后该功能在实例详情页整块 tab 都不会显示，接口也会被拒绝。
+          「跟随默认」由后端按功能的内置策略决定（PCI/USB 默认关闭，网卡/数据盘/光盘/快照默认只读）；
+          「只读」时实例详情页 tab 可见但用户不能创建/修改；「关闭」时整块 tab 不显示，接口也会被拒绝。
         </div>
         <a-row :gutter="12">
           <a-col v-for="item in LINE_FEATURE_OPTIONS" :key="item.key" :span="12">
-            <a-form-item :label="item.label">
+            <a-form-item>
+              <template #label>
+                <span>{{ item.label }}</span>
+                <a-tag v-if="item.default === 'off'" color="red" style="margin-left: 6px">默认关闭</a-tag>
+                <a-tag v-else-if="item.default === 'read'" color="orange" style="margin-left: 6px">默认只读</a-tag>
+              </template>
               <a-select v-model:value="lineFeatureFlags[item.key]" size="small">
-                <a-select-option value="default">跟随插件</a-select-option>
-                <a-select-option value="on">开启</a-select-option>
-                <a-select-option value="off">关闭</a-select-option>
+                <a-select-option value="default">
+                  跟随默认（{{ LINE_FEATURE_DEFAULT_LABEL[item.default] }}）
+                </a-select-option>
+                <a-select-option value="off">关闭（不显示）</a-select-option>
+                <a-select-option value="read">只读（可见不可改）</a-select-option>
+                <a-select-option value="write">完全可用</a-select-option>
               </a-select>
               <div class="subtle" style="margin-top: 2px">{{ item.hint }}</div>
             </a-form-item>
@@ -821,21 +830,25 @@ const lineForm = reactive({
   feature_flags: {}
 });
 
-// 线路级可开关的插件功能清单（key 必须与后端 automationFeatureCatalog 一致）
+// 线路级可开关的插件功能清单（key / default 必须与后端 automationFeatureCatalog 一致）
+// default: off = 默认关闭（不显示 tab）；read = 默认只读；write = 默认完全可用
 const LINE_FEATURE_OPTIONS = [
-  { key: "firewall", label: "防火墙", hint: "虚拟机防火墙规则" },
-  { key: "port_mapping", label: "端口映射", hint: "NAT 端口转发" },
-  { key: "snapshot", label: "快照", hint: "平台原生快照" },
-  { key: "backup", label: "备份", hint: "备份与还原" },
-  { key: "nic", label: "网卡管理", hint: "增删改网卡与 IP" },
-  { key: "disk", label: "数据盘", hint: "挂载 / 卸载数据盘" },
-  { key: "iso", label: "光盘管理", hint: "挂载 / 卸载 ISO" },
-  { key: "reverse_proxy", label: "反向代理", hint: "域名反向代理" },
-  { key: "boot_order", label: "启动顺序", hint: "调整启动项顺序" },
-  { key: "pci", label: "PCI 直通", hint: "PCI / GPU 直通" },
-  { key: "usb", label: "USB 直通", hint: "USB 设备直通" }
+  { key: "firewall", label: "防火墙", hint: "虚拟机防火墙规则", default: "write" },
+  { key: "port_mapping", label: "端口映射", hint: "NAT 端口转发", default: "write" },
+  { key: "snapshot", label: "快照", hint: "平台原生快照", default: "read" },
+  { key: "backup", label: "备份", hint: "备份与还原", default: "write" },
+  { key: "nic", label: "网卡管理", hint: "查看/增删网卡与 IP", default: "read" },
+  { key: "disk", label: "数据盘", hint: "查看/挂载数据盘", default: "read" },
+  { key: "iso", label: "光盘管理", hint: "查看/挂载 ISO", default: "read" },
+  { key: "reverse_proxy", label: "反向代理", hint: "域名反向代理", default: "write" },
+  { key: "boot_order", label: "启动顺序", hint: "调整启动项顺序", default: "write" },
+  { key: "pci", label: "PCI 直通", hint: "PCI / GPU 直通，默认关闭", default: "off" },
+  { key: "usb", label: "USB 直通", hint: "USB 设备直通，默认关闭", default: "off" }
 ];
-// 三态选择：default = 跟随插件；on = 强制开启；off = 强制关闭（隐藏整个 tab）
+
+const LINE_FEATURE_DEFAULT_LABEL = { off: "关闭", read: "只读", write: "完全" };
+
+// 四态选择：default = 跟随默认策略；read = 只读（可见不可改）；write = 完全可用；off = 关闭（隐藏整个 tab）
 const lineFeatureFlags = reactive({});
 
 const resetLineFeatureFlags = () => {
@@ -846,12 +859,19 @@ const resetLineFeatureFlags = () => {
 };
 resetLineFeatureFlags();
 
+const normalizeLineFeatureMode = (raw) => {
+  if (typeof raw === "boolean") return raw ? "write" : "off";
+  const value = String(raw ?? "").toLowerCase();
+  return ["off", "read", "write"].includes(value) ? value : "";
+};
+
 const applyLineFeatureFlags = (raw) => {
   resetLineFeatureFlags();
   if (!raw || typeof raw !== "object") return;
   Object.keys(raw).forEach((key) => {
     if (!(key in lineFeatureFlags)) return;
-    lineFeatureFlags[key] = raw[key] ? "on" : "off";
+    const mode = normalizeLineFeatureMode(raw[key]);
+    if (mode) lineFeatureFlags[key] = mode;
   });
 };
 
@@ -859,8 +879,7 @@ const collectLineFeatureFlags = () => {
   const out = {};
   LINE_FEATURE_OPTIONS.forEach((item) => {
     const value = lineFeatureFlags[item.key];
-    if (value === "on") out[item.key] = true;
-    else if (value === "off") out[item.key] = false;
+    if (value === "read" || value === "write" || value === "off") out[item.key] = value;
   });
   return out;
 };

@@ -296,7 +296,7 @@ func (h *Handler) AdminPlanGroupUpdate(c *gin.Context) {
 		Visible           *bool             `json:"visible"`
 		CapacityRemaining *int              `json:"capacity_remaining"`
 		SortOrder         *int              `json:"sort_order"`
-		FeatureFlags      map[string]bool   `json:"feature_flags"`
+		FeatureFlags      featureFlagMap    `json:"feature_flags"`
 	}
 	if err := bindJSON(c, &payload); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidBody.Error()})

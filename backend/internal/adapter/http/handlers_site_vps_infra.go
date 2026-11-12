@@ -60,6 +60,19 @@ func (h *Handler) loadVPSForFeature(c *gin.Context, id int64, feature, label str
 	return &inst
 }
 
+// loadVPSForFeatureWrite 在 loadVPSForFeature 之上增加「只读模式」校验。
+// 只读模式下功能仍可见（列表可查），但禁止一切创建/修改/删除操作。
+func (h *Handler) loadVPSForFeatureWrite(c *gin.Context, id int64, feature, label string) *domain.VPSInstance {
+	inst := h.loadVPSForFeature(c, id, feature, label)
+	if inst == nil {
+		return nil
+	}
+	if h.denyIfFeatureReadonly(c, *inst, feature, label) {
+		return nil
+	}
+	return inst
+}
+
 // ---- 网卡 ----
 
 func (h *Handler) VPSNetworkCards(c *gin.Context) {
@@ -81,6 +94,9 @@ func (h *Handler) VPSNetworkCards(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items})
 	case http.MethodPost:
+		if h.denyIfFeatureReadonly(c, *inst, "nic", "网卡管理") {
+			return
+		}
 		var payload appshared.AutomationNetworkCardInput
 		if err := bindJSON(c, &payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidBody.Error()})
@@ -102,7 +118,7 @@ func (h *Handler) VPSNetworkCardUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidInput.Error()})
 		return
 	}
-	inst := h.loadVPSForFeature(c, uri.ID, "nic", "网卡管理")
+	inst := h.loadVPSForFeatureWrite(c, uri.ID, "nic", "网卡管理")
 	if inst == nil {
 		return
 	}
@@ -124,7 +140,7 @@ func (h *Handler) VPSNetworkCardDelete(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidInput.Error()})
 		return
 	}
-	inst := h.loadVPSForFeature(c, uri.ID, "nic", "网卡管理")
+	inst := h.loadVPSForFeatureWrite(c, uri.ID, "nic", "网卡管理")
 	if inst == nil {
 		return
 	}
@@ -161,7 +177,7 @@ func (h *Handler) VPSDiskMount(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidId.Error()})
 		return
 	}
-	inst := h.loadVPSForFeature(c, uri.ID, "disk", "数据盘")
+	inst := h.loadVPSForFeatureWrite(c, uri.ID, "disk", "数据盘")
 	if inst == nil {
 		return
 	}
@@ -187,7 +203,7 @@ func (h *Handler) VPSDiskUnmount(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidId.Error()})
 		return
 	}
-	inst := h.loadVPSForFeature(c, uri.ID, "disk", "数据盘")
+	inst := h.loadVPSForFeatureWrite(c, uri.ID, "disk", "数据盘")
 	if inst == nil {
 		return
 	}
@@ -211,7 +227,7 @@ func (h *Handler) VPSDiskDelete(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidInput.Error()})
 		return
 	}
-	inst := h.loadVPSForFeature(c, uri.ID, "disk", "数据盘")
+	inst := h.loadVPSForFeatureWrite(c, uri.ID, "disk", "数据盘")
 	if inst == nil {
 		return
 	}
@@ -243,6 +259,9 @@ func (h *Handler) VPSISOs(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items, "available": available})
 	case http.MethodPost:
+		if h.denyIfFeatureReadonly(c, *inst, "iso", "光盘管理") {
+			return
+		}
 		var payload appshared.AutomationISOInput
 		if err := bindJSON(c, &payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidBody.Error()})
@@ -264,7 +283,7 @@ func (h *Handler) VPSISOUnmount(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidInput.Error()})
 		return
 	}
-	inst := h.loadVPSForFeature(c, uri.ID, "iso", "光盘管理")
+	inst := h.loadVPSForFeatureWrite(c, uri.ID, "iso", "光盘管理")
 	if inst == nil {
 		return
 	}
@@ -296,6 +315,9 @@ func (h *Handler) VPSReverseProxies(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items})
 	case http.MethodPost:
+		if h.denyIfFeatureReadonly(c, *inst, "reverse_proxy", "反向代理") {
+			return
+		}
 		var payload appshared.AutomationReverseProxyInput
 		if err := bindJSON(c, &payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidBody.Error()})
@@ -317,7 +339,7 @@ func (h *Handler) VPSReverseProxyUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidInput.Error()})
 		return
 	}
-	inst := h.loadVPSForFeature(c, uri.ID, "reverse_proxy", "反向代理")
+	inst := h.loadVPSForFeatureWrite(c, uri.ID, "reverse_proxy", "反向代理")
 	if inst == nil {
 		return
 	}
@@ -339,7 +361,7 @@ func (h *Handler) VPSReverseProxyDelete(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidInput.Error()})
 		return
 	}
-	inst := h.loadVPSForFeature(c, uri.ID, "reverse_proxy", "反向代理")
+	inst := h.loadVPSForFeatureWrite(c, uri.ID, "reverse_proxy", "反向代理")
 	if inst == nil {
 		return
 	}
@@ -371,6 +393,9 @@ func (h *Handler) VPSBootOrder(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items})
 	case http.MethodPut, http.MethodPost:
+		if h.denyIfFeatureReadonly(c, *inst, "boot_order", "启动顺序") {
+			return
+		}
 		var payload struct {
 			Items []appshared.AutomationBootOption `json:"items" binding:"required,min=1,max=32,dive"`
 		}
@@ -409,6 +434,9 @@ func (h *Handler) VPSPCIDevices(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items})
 	case http.MethodPost:
+		if h.denyIfFeatureReadonly(c, *inst, "pci", "PCI 直通") {
+			return
+		}
 		var payload appshared.AutomationPassthroughInput
 		if err := bindJSON(c, &payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidBody.Error()})
@@ -443,6 +471,9 @@ func (h *Handler) VPSUSBDevices(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items})
 	case http.MethodPost:
+		if h.denyIfFeatureReadonly(c, *inst, "usb", "USB 直通") {
+			return
+		}
 		var payload appshared.AutomationPassthroughInput
 		if err := bindJSON(c, &payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidBody.Error()})

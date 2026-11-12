@@ -438,6 +438,9 @@ func (h *Handler) VPSSnapshots(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items})
 	case http.MethodPost:
+		if h.denyIfFeatureReadonly(c, inst, "snapshot", "快照") {
+			return
+		}
 		// 请求体可选：留空时由平台生成默认快照名。
 		var payload struct {
 			Name        string `json:"name" binding:"omitempty,max=40"`
@@ -477,6 +480,9 @@ func (h *Handler) VPSSnapshotDelete(c *gin.Context) {
 	if h.denyIfFeatureDisabled(c, inst, "snapshot", "快照") {
 		return
 	}
+	if h.denyIfFeatureReadonly(c, inst, "snapshot", "快照") {
+		return
+	}
 	if err := h.vpsSvc.DeleteSnapshot(c, inst, uri.SnapshotID); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, appshared.ErrNotSupported) {
@@ -500,6 +506,9 @@ func (h *Handler) VPSSnapshotRestore(c *gin.Context) {
 		return
 	}
 	if h.denyIfFeatureDisabled(c, inst, "snapshot", "快照") {
+		return
+	}
+	if h.denyIfFeatureReadonly(c, inst, "snapshot", "快照") {
 		return
 	}
 	if err := h.vpsSvc.RestoreSnapshot(c, inst, uri.SnapshotID); err != nil {
@@ -540,6 +549,9 @@ func (h *Handler) VPSBackups(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items})
 	case http.MethodPost:
+		if h.denyIfFeatureReadonly(c, inst, "backup", "备份") {
+			return
+		}
 		if err := h.vpsSvc.CreateBackup(c, inst); err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, appshared.ErrNotSupported) {
@@ -568,6 +580,9 @@ func (h *Handler) VPSBackupDelete(c *gin.Context) {
 	if h.denyIfFeatureDisabled(c, inst, "backup", "备份") {
 		return
 	}
+	if h.denyIfFeatureReadonly(c, inst, "backup", "备份") {
+		return
+	}
 	if err := h.vpsSvc.DeleteBackup(c, inst, uri.BackupID); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, appshared.ErrNotSupported) {
@@ -591,6 +606,9 @@ func (h *Handler) VPSBackupRestore(c *gin.Context) {
 		return
 	}
 	if h.denyIfFeatureDisabled(c, inst, "backup", "备份") {
+		return
+	}
+	if h.denyIfFeatureReadonly(c, inst, "backup", "备份") {
 		return
 	}
 	if err := h.vpsSvc.RestoreBackup(c, inst, uri.BackupID); err != nil {
@@ -631,6 +649,9 @@ func (h *Handler) VPSFirewallRules(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items, "state": state})
 	case http.MethodPost:
+		if h.denyIfFeatureReadonly(c, inst, "firewall", "防火墙") {
+			return
+		}
 		var payload vpsFirewallRulePayload
 		if err := bindJSON(c, &payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidBody.Error()})
@@ -665,6 +686,9 @@ func (h *Handler) VPSFirewallUpdate(c *gin.Context) {
 	if h.denyIfFeatureDisabled(c, inst, "firewall", "防火墙") {
 		return
 	}
+	if h.denyIfFeatureReadonly(c, inst, "firewall", "防火墙") {
+		return
+	}
 	var payload vpsFirewallRulePayload
 	if err := bindJSON(c, &payload); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidBody.Error()})
@@ -694,6 +718,9 @@ func (h *Handler) VPSFirewallOptions(c *gin.Context) {
 		return
 	}
 	if h.denyIfFeatureDisabled(c, inst, "firewall", "防火墙") {
+		return
+	}
+	if h.denyIfFeatureReadonly(c, inst, "firewall", "防火墙") {
 		return
 	}
 	var payload struct {
@@ -734,6 +761,9 @@ func (h *Handler) VPSFirewallDelete(c *gin.Context) {
 	if h.denyIfFeatureDisabled(c, inst, "firewall", "防火墙") {
 		return
 	}
+	if h.denyIfFeatureReadonly(c, inst, "firewall", "防火墙") {
+		return
+	}
 	if err := h.vpsSvc.DeleteFirewallRule(c, inst, uri.RuleID); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, appshared.ErrNotSupported) {
@@ -772,6 +802,9 @@ func (h *Handler) VPSPortMappings(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items})
 	case http.MethodPost:
+		if h.denyIfFeatureReadonly(c, inst, "port_mapping", "端口映射") {
+			return
+		}
 		var payload map[string]any
 		if err := bindJSON(c, &payload); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": domain.ErrInvalidBody.Error()})
@@ -872,6 +905,9 @@ func (h *Handler) VPSPortMappingDelete(c *gin.Context) {
 		return
 	}
 	if h.denyIfFeatureDisabled(c, inst, "port_mapping", "端口映射") {
+		return
+	}
+	if h.denyIfFeatureReadonly(c, inst, "port_mapping", "端口映射") {
 		return
 	}
 	if err := h.vpsSvc.DeletePortMapping(c, inst, uri.MappingID); err != nil {

@@ -301,8 +301,10 @@ func (s *coreServer) GetManifest(_ context.Context, _ *pluginv1.Empty) (*pluginv
 	return &pluginv1.Manifest{
 		PluginId:    "openidc_default",
 		Name:        "OpenIDCS Automation (Built-in)",
-		Version:     "0.1.0",
-		Description: "Built-in OpenIDCS-Client automation plugin (catalog + lifecycle + port_mapping + backup + catalog_writeback).",
+		// 注意：version/name/plugin_id 必须与 plugins/automation/openidc_default/manifest.json 完全一致，
+		// 否则宿主启动插件时会报 "manifest mismatch: version"。
+		Version:     "0.2.0",
+		Description: "Built-in OpenIDCS-Client automation plugin (catalog + lifecycle + port_mapping + firewall + snapshot + backup + nic/disk/iso/proxy/boot/pci/usb).",
 		Automation: &pluginv1.AutomationCapability{
 			Features: []pluginv1.AutomationFeature{
 				pluginv1.AutomationFeature_AUTOMATION_FEATURE_CATALOG_SYNC,

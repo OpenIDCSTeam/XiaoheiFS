@@ -62,18 +62,6 @@
     </div>
 
     <!-- Main Tabs -->
-    <div v-if="unsupportedFeatureHints.length" class="capability-notice">
-      <a-alert type="info" show-icon>
-        <template #message>部分功能按实例能力已自动隐藏</template>
-        <template #description>
-          <div class="capability-tags">
-            <a-tag v-for="item in unsupportedFeatureHints" :key="item.key" color="default">
-              {{ item.label }}：{{ item.reason }}
-            </a-tag>
-          </div>
-        </template>
-      </a-alert>
-    </div>
     <a-tabs v-model:activeKey="activeTab" class="ecs-tabs" :tab-bar-gutter="6">
       <a-tab-pane key="overview">
         <template #tab>
@@ -1817,35 +1805,8 @@ const showBootOrderTab = computed(() => supportsAutomationFeature("boot_order"))
 const showPciTab = computed(() => supportsAutomationFeature("pci"));
 const showUsbTab = computed(() => supportsAutomationFeature("usb"));
 
-const unsupportedFeatureHints = computed(() => {
-  const rawFeatures = detail.value?.capabilities?.automation?.features;
-  if (!Array.isArray(rawFeatures)) return [];
-  const reasons = detail.value?.capabilities?.automation?.not_supported_reasons || {};
-  const defs = [
-    { key: "firewall", label: "防火墙", visible: showFirewallTab.value },
-    { key: "port_mapping", label: "端口映射", visible: showPortTab.value },
-    { key: "snapshot", label: "快照", visible: showSnapshotTab.value },
-    { key: "backup", label: "备份", visible: showBackupTab.value },
-    { key: "nic", label: "网卡", visible: showNicTab.value },
-    { key: "disk", label: "数据盘", visible: showDiskTab.value },
-    { key: "iso", label: "光盘", visible: showIsoTab.value },
-    { key: "reverse_proxy", label: "反向代理", visible: showReverseProxyTab.value },
-    { key: "boot_order", label: "启动顺序", visible: showBootOrderTab.value },
-    { key: "pci", label: "PCI 直通", visible: showPciTab.value },
-    { key: "usb", label: "USB 直通", visible: showUsbTab.value },
-    { key: "resize", label: "升降配", visible: supportsAutomationFeature("resize") },
-    { key: "refund", label: "退款", visible: supportsAutomationFeature("refund") }
-  ];
-  return defs
-    .filter((item) => !item.visible)
-    .map((item) => ({
-      key: item.key,
-      label: item.label,
-      reason: String(reasons[item.key] || "当前实例不支持该能力")
-    }));
-});
 
-// 只读功能集合：功能本身可见（tab 渲染、列表可查），但不允许创建/修改/删除。
+// 功能是否只读：功能本身可见（tab 渲染、列表可查），但不允许创建/修改/删除。
 // 来源是后端下发的 capabilities.automation.readonly_features。
 const readonlyFeatureSet = computed(() => {
   const list = detail.value?.capabilities?.automation?.readonly_features;
@@ -4770,15 +4731,6 @@ onBeforeUnmount(() => {
 }
 
 /* ========== Security Cards ========== */
-.capability-notice {
-  margin-bottom: 12px;
-}
-
-.capability-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
 
 .tab-actions {
   margin-bottom: 16px;

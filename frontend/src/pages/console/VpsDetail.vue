@@ -3024,8 +3024,9 @@ const createBackup = async () => {
   if (!ensureFeatureWritable("backup", "备份")) return;
   try {
     await createVpsBackup(id);
+    // 备份是分钟级后台任务，接口只回「已受理」，完成后记录才会出现在列表里。
+    message.success("备份任务已提交，完成后点击刷新即可看到");
     await fetchBackups();
-    message.success("备份已创建");
   } catch (err) {
     message.error(err?.response?.data?.error || "创建备份失败");
   }

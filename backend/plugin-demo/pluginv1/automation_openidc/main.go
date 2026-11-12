@@ -1711,7 +1711,10 @@ func (a *automationServer) ListBackups(ctx context.Context, req *pluginv1.ListBa
 			Id:            int64(i), // 用索引作为 ID
 			Name:          b.BackupName,
 			CreatedAtUnix: createdAt,
-			State:         1,
+			// 主控的备份列表只会返回已经落盘的备份文件（vzdump 完成后才写入记录、
+			// 或从 PVE 存储内容同步而来），不存在「创建中」的条目，
+			// 因此统一标记为 2 = 创建成功。此前写死 1 会让列表永久显示「创建中」。
+			State: snapshotStateCreated,
 		})
 	}
 	return &pluginv1.ListBackupsResponse{Items: out}, nil

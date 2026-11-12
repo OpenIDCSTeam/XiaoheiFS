@@ -74,7 +74,7 @@
         </template>
       </a-alert>
     </div>
-    <a-tabs v-model:activeKey="activeTab" class="ecs-tabs">
+    <a-tabs v-model:activeKey="activeTab" class="ecs-tabs" :tab-bar-gutter="6">
       <a-tab-pane key="overview">
         <template #tab>
           <DashboardOutlined class="tab-icon" />
@@ -4162,7 +4162,7 @@ onBeforeUnmount(() => {
   margin: 0 0 16px 0;
   background: #ffffff;
   border-radius: 0 0 8px 8px;
-  padding: 0 20px;
+  padding: 0 12px;
   border-top: 1px solid #f0f0f0;
   box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.03), 0 1px 6px -1px rgba(0, 0, 0, 0.02);
 }
@@ -4171,13 +4171,19 @@ onBeforeUnmount(() => {
   display: none;
 }
 
+/* 页签较多（概览+监控+各功能共 11 个），收紧间距保证一屏完整展示，
+   避免被折叠进右侧「...」菜单。 */
 .ecs-tabs :deep(.ant-tabs-tab) {
-  padding: 14px 20px;
+  padding: 12px 10px;
   font-weight: 500;
   color: rgba(0, 0, 0, 0.65);
-  font-size: 14px;
+  font-size: 13.5px;
   position: relative;
   transition: all 0.2s;
+}
+
+.ecs-tabs :deep(.ant-tabs-nav-list) {
+  flex-wrap: nowrap;
 }
 
 .ecs-tabs :deep(.ant-tabs-tab:hover) {
@@ -4207,7 +4213,8 @@ onBeforeUnmount(() => {
   outline: none;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  white-space: nowrap;
 }
 
 .tab-icon {
